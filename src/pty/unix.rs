@@ -13,10 +13,12 @@ use super::{ExitStatus, Pty, SpawnConfig};
 use std::collections::BTreeMap;
 use std::env;
 use std::ffi::{CString, OsString};
+use std::fs;
 use std::io;
 use std::os::raw::{c_char, c_int, c_ulong, c_void};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::path::PathBuf;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Mutex;
 
@@ -162,11 +164,34 @@ fn default_shell() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/bin/sh"))
 }
 
+/// `execve` (unlike `execvp`) never searches `$PATH`, so a bare program name
+/// (no `/`) needs resolving here first — otherwise `SpawnConfig { program:
+/// Some("sleep".into()), .. }` would fail with `ENOENT` even though `sleep`
+/// is on `$PATH`. Paths containing `/` (relative or absolute) pass through
+/// unchanged, matching `execvp`'s own rule.
+fn resolve_program(program: &Path) -> PathBuf {
+    if program.components().count() > 1 {
+        return program.to_path_buf();
+    }
+    if let Some(path_var) = env::var_os("PATH") {
+        for dir in env::split_paths(&path_var) {
+            let candidate = dir.join(program);
+            let is_executable = fs::metadata(&candidate)
+                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false);
+            if is_executable {
+                return candidate;
+            }
+        }
+    }
+    program.to_path_buf()
+}
+
 pub(super) fn spawn(config: &SpawnConfig) -> io::Result<Box<dyn Pty>> {
     let shell = config
         .program
         .as_ref()
-        .map(PathBuf::from)
+        .map(|p| resolve_program(Path::new(p)))
         .unwrap_or_else(default_shell);
     let shell_c =
         CString::new(shell.as_os_str().as_bytes()).map_err(|e| io::Error::other(e.to_string()))?;
@@ -209,6 +234,17 @@ pub(super) fn spawn(config: &SpawnConfig) -> io::Result<Box<dyn Pty>> {
     };
     if ok != 0 {
         return Err(last_error());
+    }
+    // `openpty` has no `O_CLOEXEC` equivalent, so without this, a fork() on
+    // another thread (e.g. a concurrent `spawn` for a different Terminal)
+    // racing between here and our own `fork()` below could inherit these
+    // fds, keeping this pty's slave side referenced — and thus its EOF
+    // never observed — for as long as that unrelated child runs. `dup2`
+    // in the child below gives fd 0/1/2 their own independent (non-cloexec)
+    // flags, so marking the source fds cloexec here doesn't affect them.
+    unsafe {
+        fcntl(master_fd, F_SETFD, FD_CLOEXEC);
+        fcntl(slave_fd, F_SETFD, FD_CLOEXEC);
     }
     let master = OwnedFd(master_fd);
     let slave = OwnedFd(slave_fd);
