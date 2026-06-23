@@ -78,9 +78,16 @@ impl Terminal {
         self.closed.load(Ordering::Acquire)
     }
 
-    /// Write raw bytes to the PTY input (the shell's line discipline echoes them).
-    pub fn write_str(&self, s: &str) {
-        let _ = self.with_pty(|p| p.write(s.as_bytes()));
+    /// Write text to the PTY input (the shell's line discipline echoes it).
+    pub fn write_str(&self, s: &str) -> io::Result<()> {
+        self.write_bytes(s.as_bytes())
+    }
+
+    /// Write raw bytes to the PTY input. Exposed alongside [`Terminal::write_str`]
+    /// because terminal input (e.g. pasted data, key escape sequences) is not
+    /// always valid or complete UTF-8 text.
+    pub fn write_bytes(&self, bytes: &[u8]) -> io::Result<()> {
+        self.pty_io(|p| p.write(bytes))
     }
 
     /// Resize the PTY and the VT grid to `cols` x `rows` character cells.
