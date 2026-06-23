@@ -1,12 +1,14 @@
 //! Cross-platform PTY backend via the `portable-pty` crate (ConPTY / forkpty).
 
 use super::{ExitStatus, Pty};
+use std::env;
+use std::fmt::Display;
 use std::io::{self, Read, Write};
 use std::sync::Mutex;
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
-fn oerr<E: std::fmt::Display>(e: E) -> io::Error {
+fn oerr<E: Display>(e: E) -> io::Error {
     io::Error::other(e.to_string())
 }
 
@@ -23,7 +25,7 @@ pub fn spawn() -> io::Result<Box<dyn Pty>> {
         .map_err(oerr)?;
 
     let mut cmd = CommandBuilder::new_default_prog();
-    if let Ok(cwd) = std::env::current_dir() {
+    if let Ok(cwd) = env::current_dir() {
         cmd.cwd(cwd);
     }
     // GUI processes don't inherit a terminal, so TERM is unset (or "dumb")

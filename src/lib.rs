@@ -12,7 +12,7 @@
 pub mod pty;
 pub mod vt;
 
-use std::io::Read;
+use std::io::{self, Read};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -35,11 +35,11 @@ pub struct Terminal {
 
 impl Terminal {
     /// Spawn the platform default shell on a PTY using the configured backend.
-    pub fn spawn() -> std::io::Result<Self> {
+    pub fn spawn() -> io::Result<Self> {
         let mut pty = pty::spawn_default()?;
         let reader = pty
             .take_reader()
-            .ok_or_else(|| std::io::Error::other("pty produced no reader"))?;
+            .ok_or_else(|| io::Error::other("pty produced no reader"))?;
         pty.resize(INIT_COLS, INIT_ROWS)?;
 
         let vt = Arc::new(Mutex::new(Vt::new(INIT_COLS as usize, INIT_ROWS as usize)));
@@ -60,7 +60,7 @@ impl Terminal {
     }
 
     /// Resize the PTY and the VT grid to `cols` x `rows` character cells.
-    pub fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
+    pub fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
         let cols = cols.max(1);
         let rows = rows.max(1);
         if let Ok(mut v) = self.vt.lock() {
@@ -94,17 +94,17 @@ impl Terminal {
 
     /// Non-blocking check for the shell's exit status; `Ok(None)` means it is
     /// still running.
-    pub fn try_wait(&self) -> std::io::Result<Option<pty::ExitStatus>> {
+    pub fn try_wait(&self) -> io::Result<Option<pty::ExitStatus>> {
         self.pty.try_wait()
     }
 
     /// Forcibly terminate the shell process.
-    pub fn kill(&self) -> std::io::Result<()> {
+    pub fn kill(&self) -> io::Result<()> {
         self.pty.kill()
     }
 
     /// Close the PTY input (signals EOF on the shell's stdin).
-    pub fn close_input(&self) -> std::io::Result<()> {
+    pub fn close_input(&self) -> io::Result<()> {
         self.pty.close_input()
     }
 }
