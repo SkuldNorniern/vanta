@@ -26,7 +26,7 @@ const INIT_ROWS: u16 = 40;
 
 /// A running shell on a PTY, with its output rendered through a VT grid.
 pub struct Terminal {
-    pty: Box<dyn pty::Pty>,
+    pty: Arc<Mutex<Box<dyn pty::Pty>>>,
     vt: Arc<Mutex<Vt>>,
     /// Bumped by the reader thread on every processed chunk; lets callers skip
     /// re-rendering the whole grid when nothing new has arrived.
@@ -44,7 +44,8 @@ impl Terminal {
 
         let vt = Arc::new(Mutex::new(Vt::new(INIT_COLS as usize, INIT_ROWS as usize)));
         let version = Arc::new(AtomicU64::new(0));
-        spawn_reader(reader, vt.clone(), version.clone());
+        let pty = Arc::new(Mutex::new(pty));
+        spawn_reader(reader, vt.clone(), version.clone(), pty.clone());
         Ok(Self { pty, vt, version })
     }
 
@@ -56,7 +57,7 @@ impl Terminal {
 
     /// Write raw bytes to the PTY input (the shell's line discipline echoes them).
     pub fn write_str(&self, s: &str) {
-        let _ = self.pty.write(s.as_bytes());
+        let _ = self.with_pty(|p| p.write(s.as_bytes()));
     }
 
     /// Resize the PTY and the VT grid to `cols` x `rows` character cells.
@@ -66,7 +67,7 @@ impl Terminal {
         if let Ok(mut v) = self.vt.lock() {
             v.resize(cols as usize, rows as usize);
         }
-        let result = self.pty.resize(cols, rows);
+        let result = self.pty_io(|p| p.resize(cols, rows));
         // Force the next snapshot: the grid reflowed even if no new bytes arrived.
         self.version.fetch_add(1, Ordering::Release);
         result
@@ -87,25 +88,44 @@ impl Terminal {
         self.vt.lock().map(|v| v.cursor()).unwrap_or((0, 0))
     }
 
+    /// The current window title set by the shell via OSC 0/2, if any.
+    pub fn title(&self) -> Option<String> {
+        self.vt
+            .lock()
+            .ok()
+            .and_then(|v| v.title().map(str::to_owned))
+    }
+
     /// Whether the shell process is still running.
     pub fn is_running(&self) -> bool {
-        self.pty.is_running()
+        self.with_pty(|p| p.is_running()).unwrap_or(false)
     }
 
     /// Non-blocking check for the shell's exit status; `Ok(None)` means it is
     /// still running.
     pub fn try_wait(&self) -> io::Result<Option<pty::ExitStatus>> {
-        self.pty.try_wait()
+        self.pty_io(|p| p.try_wait())
     }
 
     /// Forcibly terminate the shell process.
     pub fn kill(&self) -> io::Result<()> {
-        self.pty.kill()
+        self.pty_io(|p| p.kill())
     }
 
     /// Close the PTY input (signals EOF on the shell's stdin).
     pub fn close_input(&self) -> io::Result<()> {
-        self.pty.close_input()
+        self.pty_io(|p| p.close_input())
+    }
+
+    /// Run `f` with the locked PTY, or `None` if the lock is poisoned.
+    fn with_pty<R>(&self, f: impl FnOnce(&dyn pty::Pty) -> R) -> Option<R> {
+        self.pty.lock().ok().map(|p| f(&**p))
+    }
+
+    /// Run `f` with the locked PTY, surfacing lock poisoning as an `io::Error`.
+    fn pty_io<R>(&self, f: impl FnOnce(&dyn pty::Pty) -> io::Result<R>) -> io::Result<R> {
+        self.with_pty(f)
+            .unwrap_or_else(|| Err(io::Error::other("pty mutex poisoned")))
     }
 }
 
@@ -113,6 +133,7 @@ fn spawn_reader<R: Read + Send + 'static>(
     mut reader: R,
     vt: Arc<Mutex<Vt>>,
     version: Arc<AtomicU64>,
+    pty: Arc<Mutex<Box<dyn pty::Pty>>>,
 ) {
     thread::spawn(move || {
         let mut buf = [0u8; 4096];
@@ -120,8 +141,16 @@ fn spawn_reader<R: Read + Send + 'static>(
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if let Ok(mut v) = vt.lock() {
+                    let response = if let Ok(mut v) = vt.lock() {
                         v.process(&buf[..n]);
+                        v.take_response()
+                    } else {
+                        None
+                    };
+                    if let Some(bytes) = response {
+                        if let Ok(p) = pty.lock() {
+                            let _ = p.write(&bytes);
+                        }
                     }
                     version.fetch_add(1, Ordering::Release);
                 }
