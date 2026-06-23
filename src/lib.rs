@@ -22,7 +22,8 @@ pub use vt::{Cell, CellKind, Color};
 pub use pty::SpawnConfig;
 
 /// A consistent frame of the terminal grid, captured under one lock so the
-/// screen, scrollback, and cursor can never be torn relative to each other.
+/// screen, scrollback, cursor, title, and closed state can never be torn
+/// relative to each other.
 pub struct Snapshot {
     pub screen: Vec<Vec<Cell>>,
     pub scrollback: Vec<Vec<Cell>>,
@@ -31,6 +32,10 @@ pub struct Snapshot {
     pub cursor: (usize, usize),
     /// The [`Terminal::version`] this frame was captured at.
     pub version: u64,
+    /// Window title set by the shell via OSC 0/2, if any.
+    pub title: Option<String>,
+    /// Whether the PTY output stream has reached EOF (same as [`Terminal::is_closed`]).
+    pub closed: bool,
 }
 
 impl Snapshot {
@@ -161,10 +166,11 @@ impl Terminal {
         self.pty_io(|p| p.resize(cols, rows))
     }
 
-    /// A consistent frame of the current screen, scrollback, and cursor,
-    /// captured under one lock so the three can never be torn relative to
-    /// each other.
+    /// A consistent frame of the current screen, scrollback, cursor, title,
+    /// and closed state, captured under one lock so they can never be torn
+    /// relative to each other.
     pub fn snapshot(&self) -> Snapshot {
+        let closed = self.closed.load(Ordering::Acquire);
         self.vt
             .lock()
             .map(|v| Snapshot {
@@ -172,16 +178,23 @@ impl Terminal {
                 scrollback: v.scrollback_cells(),
                 cursor: v.cursor(),
                 version: self.version.load(Ordering::Acquire),
+                title: v.title().map(str::to_owned),
+                closed,
             })
             .unwrap_or_else(|_| Snapshot {
                 screen: Vec::new(),
                 scrollback: Vec::new(),
                 cursor: (0, 0),
                 version: self.version.load(Ordering::Acquire),
+                title: None,
+                closed,
             })
     }
 
     /// The current window title set by the shell via OSC 0/2, if any.
+    ///
+    /// For UI update loops, prefer [`Snapshot::title`] from [`Terminal::snapshot`]
+    /// which reads title and screen state under the same lock.
     pub fn title(&self) -> Option<String> {
         self.vt
             .lock()
