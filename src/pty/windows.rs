@@ -188,20 +188,20 @@ unsafe fn try_load_conpty() -> Option<ConPtyFns> {
     let name: Vec<u16> = "kernel32.dll\0".encode_utf16().collect();
     // GetModuleHandleW does not increment the refcount — safe for kernel32,
     // which is pinned for the process lifetime and always already loaded.
-    let hmod = GetModuleHandleW(name.as_ptr());
+    let hmod = unsafe { GetModuleHandleW(name.as_ptr()) };
     if hmod.is_null() {
         return None;
     }
-    let create_ptr = GetProcAddress(hmod, b"CreatePseudoConsole\0".as_ptr());
-    let resize_ptr = GetProcAddress(hmod, b"ResizePseudoConsole\0".as_ptr());
-    let close_ptr = GetProcAddress(hmod, b"ClosePseudoConsole\0".as_ptr());
+    let create_ptr = unsafe { GetProcAddress(hmod, b"CreatePseudoConsole\0".as_ptr()) };
+    let resize_ptr = unsafe { GetProcAddress(hmod, b"ResizePseudoConsole\0".as_ptr()) };
+    let close_ptr = unsafe { GetProcAddress(hmod, b"ClosePseudoConsole\0".as_ptr()) };
     if create_ptr.is_null() || resize_ptr.is_null() || close_ptr.is_null() {
         return None;
     }
     Some(ConPtyFns {
-        create: transmute(create_ptr),
-        resize: transmute(resize_ptr),
-        close: transmute(close_ptr),
+        create: unsafe { transmute(create_ptr) },
+        resize: unsafe { transmute(resize_ptr) },
+        close: unsafe { transmute(close_ptr) },
     })
 }
 
@@ -292,61 +292,63 @@ fn create_pipe() -> io::Result<(OwnedHandle, OwnedHandle)> {
     Ok((read, write))
 }
 
-/// Quote a single argument per the `CommandLineToArgvW` rules so `CreateProcessW`
-/// re-splits it back into the original argument.
-fn quote_arg(arg: &str) -> String {
-    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
-        return arg.to_string();
+/// Quote a single argument (UTF-16 code units) per `CommandLineToArgvW` rules
+/// so `CreateProcessW` re-splits it back into the original argument.
+fn quote_arg_wide(arg: &OsStr) -> Vec<u16> {
+    let w: Vec<u16> = arg.encode_wide().collect();
+    const SPACE: u16 = b' ' as u16;
+    const TAB: u16 = b'\t' as u16;
+    const QUOTE: u16 = b'"' as u16;
+    const BACKSLASH: u16 = b'\\' as u16;
+    if !w.is_empty() && !w.iter().any(|&c| c == SPACE || c == TAB || c == QUOTE) {
+        return w;
     }
-    let mut result = String::from("\"");
-    let mut chars = arg.chars().peekable();
-    loop {
+    let mut result = vec![QUOTE];
+    let mut i = 0;
+    while i < w.len() {
         let mut backslashes = 0usize;
-        while chars.peek() == Some(&'\\') {
+        while i < w.len() && w[i] == BACKSLASH {
             backslashes += 1;
-            chars.next();
+            i += 1;
         }
-        match chars.next() {
-            Some('"') => {
-                result.extend(repeat_n('\\', backslashes * 2 + 1));
-                result.push('"');
-            }
-            Some(c) => {
-                result.extend(repeat_n('\\', backslashes));
-                result.push(c);
-            }
-            None => {
-                result.extend(repeat_n('\\', backslashes * 2));
-                break;
-            }
+        if i == w.len() {
+            result.extend(repeat_n(BACKSLASH, backslashes * 2));
+            break;
+        } else if w[i] == QUOTE {
+            result.extend(repeat_n(BACKSLASH, backslashes * 2 + 1));
+            result.push(QUOTE);
+            i += 1;
+        } else {
+            result.extend(repeat_n(BACKSLASH, backslashes));
+            result.push(w[i]);
+            i += 1;
         }
     }
-    result.push('"');
+    result.push(QUOTE);
     result
 }
 
-fn build_command_line(program: &str, args: &[String]) -> Vec<u16> {
-    let mut line = quote_arg(program);
+fn build_command_line(program: &OsStr, args: &[OsString]) -> Vec<u16> {
+    let mut line = quote_arg_wide(program);
     for arg in args {
-        line.push(' ');
-        line.push_str(&quote_arg(arg));
+        line.push(b' ' as u16);
+        line.extend(quote_arg_wide(arg.as_os_str()));
     }
-    let mut wide: Vec<u16> = line.encode_utf16().collect();
-    wide.push(0);
-    wide
+    line.push(0); // NUL terminator
+    line
 }
 
 /// Build a `CreateProcessW` environment block: the inherited environment with
 /// `overrides` applied, as `"KEY=value\0...\0\0"` UTF-16.
-fn build_env_block<'a>(overrides: impl IntoIterator<Item = (&'a str, &'a str)>) -> Vec<u16> {
+fn build_env_block(overrides: impl IntoIterator<Item = (OsString, OsString)>) -> Vec<u16> {
     let mut vars: BTreeMap<OsString, OsString> = env::vars_os().collect();
     for (key, value) in overrides {
-        vars.insert(OsString::from(key), OsString::from(value));
+        vars.insert(key, value);
     }
     let mut block = Vec::new();
     for (key, value) in vars {
         block.extend(key.encode_wide());
-        block.push('=' as u16);
+        block.push(b'=' as u16);
         block.extend(value.encode_wide());
         block.push(0);
     }
@@ -430,14 +432,18 @@ pub(super) fn spawn(config: &SpawnConfig) -> io::Result<Box<dyn Pty>> {
     si.startup_info.h_std_output = INVALID_HANDLE_VALUE;
     si.startup_info.h_std_error = INVALID_HANDLE_VALUE;
 
-    let shell = config
-        .program
-        .clone()
-        .unwrap_or_else(|| env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string()));
-    let mut cmdline = build_command_line(&shell, &config.args);
-    let mut overrides: Vec<(&str, &str)> =
-        vec![("TERM", &config.term), ("COLORTERM", &config.colorterm)];
-    overrides.extend(config.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    let shell: OsString = config.program.clone().unwrap_or_else(|| {
+        OsString::from(env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string()))
+    });
+    let mut cmdline = build_command_line(shell.as_os_str(), &config.args);
+    let mut overrides: Vec<(OsString, OsString)> = vec![
+        (OsString::from("TERM"), OsString::from(&config.term)),
+        (
+            OsString::from("COLORTERM"),
+            OsString::from(&config.colorterm),
+        ),
+    ];
+    overrides.extend(config.env.iter().cloned());
     let mut env_block = build_env_block(overrides);
     let cwd = config
         .cwd
@@ -640,43 +646,45 @@ impl Drop for InHousePty {
 
 #[cfg(test)]
 mod tests {
-    use super::quote_arg;
+    use super::quote_arg_wide;
+    use std::ffi::OsStr;
+
+    fn q(s: &str) -> String {
+        String::from_utf16_lossy(&quote_arg_wide(OsStr::new(s)))
+    }
 
     #[test]
     fn quotes_plain_argument_unchanged() {
-        assert_eq!(quote_arg("cmd.exe"), "cmd.exe");
+        assert_eq!(q("cmd.exe"), "cmd.exe");
     }
 
     #[test]
     fn quotes_argument_with_spaces() {
-        assert_eq!(quote_arg("hello world"), "\"hello world\"");
+        assert_eq!(q("hello world"), "\"hello world\"");
     }
 
     #[test]
     fn escapes_embedded_quotes() {
-        assert_eq!(quote_arg(r#"a"b"#), r#""a\"b""#);
+        assert_eq!(q(r#"a"b"#), r#""a\"b""#);
     }
 
     #[test]
     fn doubles_backslashes_before_quote() {
-        assert_eq!(quote_arg(r#"a\"b"#), r#""a\\\"b""#);
+        assert_eq!(q(r#"a\"b"#), r#""a\\\"b""#);
     }
 
     #[test]
     fn preserves_trailing_backslashes_outside_quotes() {
-        assert_eq!(quote_arg(r"C:\path\"), r"C:\path\");
+        assert_eq!(q(r"C:\path\"), r"C:\path\");
     }
 
     #[test]
     fn doubles_trailing_backslashes_when_quoted() {
-        assert_eq!(
-            quote_arg(r"C:\path with space\"),
-            "\"C:\\path with space\\\\\""
-        );
+        assert_eq!(q(r"C:\path with space\"), "\"C:\\path with space\\\\\"");
     }
 
     #[test]
     fn empty_argument_is_quoted() {
-        assert_eq!(quote_arg(""), "\"\"");
+        assert_eq!(q(""), "\"\"");
     }
 }

@@ -3,6 +3,7 @@
 //! [`Pty`] is the seam between [`crate::Terminal`] and the platform PTY: direct
 //! ConPTY FFI on Windows ([`windows`]), forkpty FFI on Unix ([`unix`]).
 
+use std::ffi::OsString;
 use std::io::{self, Read};
 use std::path::PathBuf;
 
@@ -48,13 +49,15 @@ pub trait Pty: Send {
 /// `cmd.exe`). `env` entries are applied on top of the inherited environment,
 /// after `term`/`colorterm`, so they can override those too.
 pub struct SpawnConfig {
-    pub program: Option<String>,
-    pub args: Vec<String>,
+    pub program: Option<OsString>,
+    pub args: Vec<OsString>,
     pub cwd: Option<PathBuf>,
-    pub env: Vec<(String, String)>,
+    pub env: Vec<(OsString, OsString)>,
     pub cols: u16,
     pub rows: u16,
+    /// Always UTF-8; used as the `TERM` env var value.
     pub term: String,
+    /// Always UTF-8; used as the `COLORTERM` env var value.
     pub colorterm: String,
     /// Set on the VT's title immediately after spawn, before the child has
     /// had a chance to set one itself via OSC.

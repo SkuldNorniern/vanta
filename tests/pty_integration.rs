@@ -2,6 +2,7 @@
 //! Ctrl-C, and exit status. Exercises the real platform backend (ConPTY on
 //! Windows, forkpty on Unix), not just the in-process `Vt` parser.
 
+use std::ffi::OsString;
 use std::thread;
 use std::time::{Duration, Instant};
 use vanta::{SpawnConfig, Terminal};
@@ -28,8 +29,8 @@ fn poll_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
 /// render their first prompt).
 fn direct(program: &str, args: &[&str]) -> SpawnConfig {
     SpawnConfig {
-        program: Some(program.to_owned()),
-        args: args.iter().map(|s| s.to_string()).collect(),
+        program: Some(OsString::from(program)),
+        args: args.iter().map(|s| OsString::from(*s)).collect(),
         ..SpawnConfig::default()
     }
 }

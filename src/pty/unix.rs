@@ -140,12 +140,12 @@ fn ptr_array(strings: &[CString]) -> Vec<*const c_char> {
 
 /// The inherited environment with `overrides` applied, as `"KEY=value"`
 /// `CString`s for `execve`.
-fn build_envp<'a>(
-    overrides: impl IntoIterator<Item = (&'a str, &'a str)>,
+fn build_envp(
+    overrides: impl IntoIterator<Item = (OsString, OsString)>,
 ) -> io::Result<Vec<CString>> {
     let mut vars: BTreeMap<OsString, OsString> = env::vars_os().collect();
     for (key, value) in overrides {
-        vars.insert(OsString::from(key), OsString::from(value));
+        vars.insert(key, value);
     }
     vars.into_iter()
         .map(|(key, value)| {
@@ -191,22 +191,29 @@ pub(super) fn spawn(config: &SpawnConfig) -> io::Result<Box<dyn Pty>> {
     let shell = config
         .program
         .as_ref()
-        .map(|p| resolve_program(Path::new(p)))
+        .map(|p| resolve_program(Path::new(p.as_os_str())))
         .unwrap_or_else(default_shell);
     let shell_c =
         CString::new(shell.as_os_str().as_bytes()).map_err(|e| io::Error::other(e.to_string()))?;
     let arg_cs: Vec<CString> = config
         .args
         .iter()
-        .map(|a| CString::new(a.as_bytes()).map_err(|e| io::Error::other(e.to_string())))
+        .map(|a| {
+            CString::new(a.as_os_str().as_bytes()).map_err(|e| io::Error::other(e.to_string()))
+        })
         .collect::<io::Result<_>>()?;
     let mut argv_strings = Vec::with_capacity(1 + arg_cs.len());
     argv_strings.push(shell_c.clone());
     argv_strings.extend(arg_cs);
     let argv = ptr_array(&argv_strings);
-    let mut overrides: Vec<(&str, &str)> =
-        vec![("TERM", &config.term), ("COLORTERM", &config.colorterm)];
-    overrides.extend(config.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    let mut overrides: Vec<(OsString, OsString)> = vec![
+        (OsString::from("TERM"), OsString::from(&config.term)),
+        (
+            OsString::from("COLORTERM"),
+            OsString::from(&config.colorterm),
+        ),
+    ];
+    overrides.extend(config.env.iter().cloned());
     let envp_strings = build_envp(overrides)?;
     let envp = ptr_array(&envp_strings);
     let cwd_c = config
