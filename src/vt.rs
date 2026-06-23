@@ -344,6 +344,12 @@ impl Vt {
         self.title.as_deref()
     }
 
+    /// Set the window title directly (e.g. an initial title from spawn
+    /// configuration, before the child has had a chance to set one via OSC).
+    pub fn set_title(&mut self, title: impl Into<String>) {
+        self.title = Some(title.into());
+    }
+
     /// Whether the cursor should be displayed (DECTCEM, DECSET/DECRST 25).
     pub fn cursor_visible(&self) -> bool {
         self.cursor_visible

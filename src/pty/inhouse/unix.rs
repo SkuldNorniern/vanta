@@ -9,7 +9,7 @@
 //! `execve`. The parent keeps the master fd (duplicated once more so the
 //! reader and the writer/resize/kill side each own an independent fd).
 
-use super::super::{ExitStatus, Pty};
+use super::super::{ExitStatus, Pty, SpawnConfig};
 use std::collections::BTreeMap;
 use std::env;
 use std::ffi::{CString, OsString};
@@ -18,7 +18,6 @@ use std::os::raw::{c_char, c_int, c_ulong, c_void};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 use std::ptr;
-use std::slice;
 use std::sync::Mutex;
 
 type Pid = c_int;
@@ -55,9 +54,6 @@ struct Winsize {
     ws_xpixel: u16,
     ws_ypixel: u16,
 }
-
-const DEFAULT_COLS: u16 = 120;
-const DEFAULT_ROWS: u16 = 40;
 
 // `openpty` lives in `libutil` on Linux and the BSDs; macOS has it in the
 // default system library, so no extra `#[link]` is needed there.
@@ -140,9 +136,11 @@ fn ptr_array(strings: &[CString]) -> Vec<*const c_char> {
     ptrs
 }
 
-/// The inherited environment with `TERM`/`COLORTERM` overrides applied, as
-/// `"KEY=value"` `CString`s for `execve`.
-fn build_envp(overrides: &[(&str, &str)]) -> io::Result<Vec<CString>> {
+/// The inherited environment with `overrides` applied, as `"KEY=value"`
+/// `CString`s for `execve`.
+fn build_envp<'a>(
+    overrides: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> io::Result<Vec<CString>> {
     let mut vars: BTreeMap<OsString, OsString> = env::vars_os().collect();
     for (key, value) in overrides {
         vars.insert(OsString::from(key), OsString::from(value));
@@ -164,20 +162,37 @@ fn default_shell() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/bin/sh"))
 }
 
-pub(super) fn spawn() -> io::Result<Box<dyn Pty>> {
-    let shell = default_shell();
+pub(super) fn spawn(config: &SpawnConfig) -> io::Result<Box<dyn Pty>> {
+    let shell = config
+        .program
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(default_shell);
     let shell_c =
         CString::new(shell.as_os_str().as_bytes()).map_err(|e| io::Error::other(e.to_string()))?;
-    let argv = ptr_array(slice::from_ref(&shell_c));
-    let envp_strings = build_envp(&[("TERM", "xterm-256color"), ("COLORTERM", "truecolor")])?;
+    let arg_cs: Vec<CString> = config
+        .args
+        .iter()
+        .map(|a| CString::new(a.as_bytes()).map_err(|e| io::Error::other(e.to_string())))
+        .collect::<io::Result<_>>()?;
+    let mut argv_strings = Vec::with_capacity(1 + arg_cs.len());
+    argv_strings.push(shell_c.clone());
+    argv_strings.extend(arg_cs);
+    let argv = ptr_array(&argv_strings);
+    let mut overrides: Vec<(&str, &str)> =
+        vec![("TERM", &config.term), ("COLORTERM", &config.colorterm)];
+    overrides.extend(config.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    let envp_strings = build_envp(overrides)?;
     let envp = ptr_array(&envp_strings);
-    let cwd_c = env::current_dir()
-        .ok()
+    let cwd_c = config
+        .cwd
+        .clone()
+        .or_else(|| env::current_dir().ok())
         .and_then(|p| CString::new(p.as_os_str().as_bytes()).ok());
 
     let winsize = Winsize {
-        ws_row: DEFAULT_ROWS,
-        ws_col: DEFAULT_COLS,
+        ws_row: config.rows,
+        ws_col: config.cols,
         ws_xpixel: 0,
         ws_ypixel: 0,
     };

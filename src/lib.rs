@@ -19,9 +19,7 @@ use std::thread;
 use vt::Vt;
 pub use vt::{Cell, Color};
 
-/// Initial PTY/grid size (cells). The GUI resizes to the visible area.
-const INIT_COLS: u16 = 120;
-const INIT_ROWS: u16 = 40;
+pub use pty::SpawnConfig;
 
 /// A running shell on a PTY, with its output rendered through a VT grid.
 pub struct Terminal {
@@ -37,15 +35,32 @@ pub struct Terminal {
 }
 
 impl Terminal {
-    /// Spawn the platform default shell on a PTY using the configured backend.
+    /// Spawn the platform default shell on a PTY at the default size.
     pub fn spawn() -> io::Result<Self> {
-        let mut pty = pty::spawn_default()?;
+        Self::spawn_with_config(&SpawnConfig::default())
+    }
+
+    /// Spawn the platform default shell on a PTY sized to `cols` x `rows`.
+    pub fn spawn_with_size(cols: u16, rows: u16) -> io::Result<Self> {
+        Self::spawn_with_config(&SpawnConfig {
+            cols,
+            rows,
+            ..SpawnConfig::default()
+        })
+    }
+
+    /// Spawn `config` on a PTY using the compiled-in backend.
+    pub fn spawn_with_config(config: &SpawnConfig) -> io::Result<Self> {
+        let mut pty = pty::spawn(config)?;
         let reader = pty
             .take_reader()
             .ok_or_else(|| io::Error::other("pty produced no reader"))?;
-        pty.resize(INIT_COLS, INIT_ROWS)?;
 
-        let vt = Arc::new(Mutex::new(Vt::new(INIT_COLS as usize, INIT_ROWS as usize)));
+        let mut vt_inner = Vt::new(config.cols as usize, config.rows as usize);
+        if let Some(title) = &config.title {
+            vt_inner.set_title(title.clone());
+        }
+        let vt = Arc::new(Mutex::new(vt_inner));
         let version = Arc::new(AtomicU64::new(0));
         let closed = Arc::new(AtomicBool::new(false));
         let pty = Arc::new(Mutex::new(pty));

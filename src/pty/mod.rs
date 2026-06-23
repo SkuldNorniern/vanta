@@ -4,6 +4,7 @@
 //! implementation: [`inhouse`], direct ConPTY (Windows) / forkpty (Unix) FFI.
 
 use std::io::{self, Read};
+use std::path::PathBuf;
 
 pub mod inhouse;
 
@@ -37,16 +38,58 @@ pub trait Pty: Send {
     fn close_input(&self) -> io::Result<()>;
 }
 
-/// Spawn the default shell on a PTY using the compiled-in backend.
-pub fn spawn_default() -> io::Result<Box<dyn Pty>> {
+/// What to spawn on the PTY and how to size/environment it.
+///
+/// `program` of `None` means the platform default shell (`$SHELL` on Unix,
+/// falling back to `/bin/sh`; `%COMSPEC%` on Windows, falling back to
+/// `cmd.exe`). `env` entries are applied on top of the inherited environment,
+/// after `term`/`colorterm`, so they can override those too.
+pub struct SpawnConfig {
+    pub program: Option<String>,
+    pub args: Vec<String>,
+    pub cwd: Option<PathBuf>,
+    pub env: Vec<(String, String)>,
+    pub cols: u16,
+    pub rows: u16,
+    pub term: String,
+    pub colorterm: String,
+    /// Set on the VT's title immediately after spawn, before the child has
+    /// had a chance to set one itself via OSC.
+    pub title: Option<String>,
+}
+
+impl Default for SpawnConfig {
+    fn default() -> Self {
+        Self {
+            program: None,
+            args: Vec::new(),
+            cwd: None,
+            env: Vec::new(),
+            cols: 120,
+            rows: 40,
+            term: "xterm-256color".to_owned(),
+            colorterm: "truecolor".to_owned(),
+            title: None,
+        }
+    }
+}
+
+/// Spawn `config` on a PTY using the compiled-in backend.
+pub fn spawn(config: &SpawnConfig) -> io::Result<Box<dyn Pty>> {
     #[cfg(feature = "inhouse")]
     {
-        inhouse::spawn()
+        inhouse::spawn(config)
     }
     #[cfg(not(feature = "inhouse"))]
     {
+        let _ = config;
         Err(io::Error::other(
             "no PTY backend enabled (enable `inhouse`)",
         ))
     }
+}
+
+/// Spawn the platform default shell on a PTY using the compiled-in backend.
+pub fn spawn_default() -> io::Result<Box<dyn Pty>> {
+    spawn(&SpawnConfig::default())
 }

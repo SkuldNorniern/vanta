@@ -8,21 +8,22 @@ mod unix;
 #[cfg(windows)]
 mod windows;
 
-use super::Pty;
+use super::{Pty, SpawnConfig};
 use std::io;
 
-/// Spawn the platform default shell on an in-house PTY.
-pub fn spawn() -> io::Result<Box<dyn Pty>> {
+/// Spawn `config` on an in-house PTY.
+pub fn spawn(config: &SpawnConfig) -> io::Result<Box<dyn Pty>> {
     #[cfg(windows)]
     {
-        windows::spawn()
+        windows::spawn(config)
     }
     #[cfg(unix)]
     {
-        unix::spawn()
+        unix::spawn(config)
     }
     #[cfg(not(any(windows, unix)))]
     {
+        let _ = config;
         Err(io::Error::other(
             "in-house PTY backend has no implementation for this platform",
         ))

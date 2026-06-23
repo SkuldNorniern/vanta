@@ -6,7 +6,7 @@
 //! then `CreateProcessW`. The host keeps the input pipe's write end and the
 //! output pipe's read end.
 
-use super::super::{ExitStatus, Pty};
+use super::super::{ExitStatus, Pty, SpawnConfig};
 use std::collections::BTreeMap;
 use std::env;
 use std::ffi::{OsStr, OsString, c_void};
@@ -29,8 +29,6 @@ const WAIT_TIMEOUT: u32 = 258;
 const ERROR_BROKEN_PIPE: i32 = 109;
 const ERROR_HANDLE_EOF: i32 = 38;
 const ERROR_NO_DATA: i32 = 232;
-const DEFAULT_COLS: i16 = 120;
-const DEFAULT_ROWS: i16 = 40;
 
 #[repr(C)]
 struct Coord {
@@ -277,7 +275,7 @@ fn build_command_line(program: &str, args: &[String]) -> Vec<u16> {
 
 /// Build a `CreateProcessW` environment block: the inherited environment with
 /// `overrides` applied, as `"KEY=value\0...\0\0"` UTF-16.
-fn build_env_block(overrides: &[(&str, &str)]) -> Vec<u16> {
+fn build_env_block<'a>(overrides: impl IntoIterator<Item = (&'a str, &'a str)>) -> Vec<u16> {
     let mut vars: BTreeMap<OsString, OsString> = env::vars_os().collect();
     for (key, value) in overrides {
         vars.insert(OsString::from(key), OsString::from(value));
@@ -299,7 +297,7 @@ fn wide_nul(s: &OsStr) -> Vec<u16> {
     w
 }
 
-pub(super) fn spawn() -> io::Result<Box<dyn Pty>> {
+pub(super) fn spawn(config: &SpawnConfig) -> io::Result<Box<dyn Pty>> {
     let (input_read, input_write) = create_pipe()?;
     let (output_read, output_write) = create_pipe()?;
 
@@ -307,8 +305,8 @@ pub(super) fn spawn() -> io::Result<Box<dyn Pty>> {
     let hr = unsafe {
         CreatePseudoConsole(
             Coord {
-                x: DEFAULT_COLS,
-                y: DEFAULT_ROWS,
+                x: config.cols as i16,
+                y: config.rows as i16,
             },
             input_read.0,
             output_write.0,
@@ -367,10 +365,20 @@ pub(super) fn spawn() -> io::Result<Box<dyn Pty>> {
     si.startup_info.h_std_output = INVALID_HANDLE_VALUE;
     si.startup_info.h_std_error = INVALID_HANDLE_VALUE;
 
-    let shell = env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
-    let mut cmdline = build_command_line(&shell, &[]);
-    let mut env_block = build_env_block(&[("TERM", "xterm-256color"), ("COLORTERM", "truecolor")]);
-    let cwd = env::current_dir().ok().map(|p| wide_nul(p.as_os_str()));
+    let shell = config
+        .program
+        .clone()
+        .unwrap_or_else(|| env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string()));
+    let mut cmdline = build_command_line(&shell, &config.args);
+    let mut overrides: Vec<(&str, &str)> =
+        vec![("TERM", &config.term), ("COLORTERM", &config.colorterm)];
+    overrides.extend(config.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    let mut env_block = build_env_block(overrides);
+    let cwd = config
+        .cwd
+        .clone()
+        .or_else(|| env::current_dir().ok())
+        .map(|p| wide_nul(p.as_os_str()));
     let cwd_ptr = cwd.as_ref().map_or(ptr::null(), |w| w.as_ptr());
 
     let mut pi: ProcessInformation = unsafe { zeroed() };
