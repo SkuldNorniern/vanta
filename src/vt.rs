@@ -1071,14 +1071,21 @@ impl Vt {
     /// The full visible grid as coloured cells: scrollback then screen, one
     /// `Vec<Cell>` per line with trailing blank cells trimmed.
     pub fn render_cells(&self) -> Vec<Vec<Cell>> {
-        let mut out: Vec<Vec<Cell>> = Vec::with_capacity(self.scrollback.len() + self.rows);
-        for line in &self.scrollback {
-            out.push(trim_cells(line));
-        }
-        for row in &self.screen {
-            out.push(trim_cells(row));
-        }
+        let mut out = self.scrollback_cells();
+        out.extend(self.screen_cells());
         out
+    }
+
+    /// The visible screen only (no scrollback), one `Vec<Cell>` per line with
+    /// trailing blank cells trimmed.
+    pub fn screen_cells(&self) -> Vec<Vec<Cell>> {
+        self.screen.iter().map(|row| trim_cells(row)).collect()
+    }
+
+    /// Scrollback history only (no visible screen), one `Vec<Cell>` per line
+    /// with trailing blank cells trimmed.
+    pub fn scrollback_cells(&self) -> Vec<Vec<Cell>> {
+        self.scrollback.iter().map(|row| trim_cells(row)).collect()
     }
 }
 

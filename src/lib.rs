@@ -17,9 +17,50 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use vt::Vt;
-pub use vt::{Cell, Color};
+pub use vt::{Cell, CellKind, Color};
 
 pub use pty::SpawnConfig;
+
+/// A consistent frame of the terminal grid, captured under one lock so the
+/// screen, scrollback, and cursor can never be torn relative to each other.
+pub struct Snapshot {
+    pub screen: Vec<Vec<Cell>>,
+    pub scrollback: Vec<Vec<Cell>>,
+    /// The cursor's absolute `(line, col)`: `line` counts scrollback rows
+    /// then screen rows, matching `cells_snapshot()`'s row order.
+    pub cursor: (usize, usize),
+    /// The [`Terminal::version`] this frame was captured at.
+    pub version: u64,
+}
+
+impl Snapshot {
+    /// Scrollback followed by the visible screen, one `Vec<Cell>` per line.
+    pub fn cells_snapshot(&self) -> Vec<Vec<Cell>> {
+        let mut out = self.scrollback.clone();
+        out.extend(self.screen.iter().cloned());
+        out
+    }
+
+    /// `cells_snapshot()` rendered as plain text, for debugging.
+    pub fn text_snapshot(&self) -> String {
+        let rows: Vec<String> = self
+            .scrollback
+            .iter()
+            .chain(self.screen.iter())
+            .map(|row| {
+                row.iter()
+                    .filter_map(|cell| match &cell.kind {
+                        CellKind::Empty => Some(' '.to_string()),
+                        CellKind::Char(c) => Some(c.to_string()),
+                        CellKind::Cluster(s) => Some(s.to_string()),
+                        CellKind::Continuation => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        rows.join("\n")
+    }
+}
 
 /// A running shell on a PTY, with its output rendered through a VT grid.
 pub struct Terminal {
@@ -111,26 +152,33 @@ impl Terminal {
         let rows = rows.max(1);
         if let Ok(mut v) = self.vt.lock() {
             v.resize(cols as usize, rows as usize);
+            // Force the next snapshot: the grid reflowed even if no new bytes
+            // arrived. Bumped while still holding the vt lock so a concurrent
+            // `snapshot()` never sees the reflowed grid paired with a stale
+            // version (see the matching ordering in `spawn_reader`).
+            self.version.fetch_add(1, Ordering::Release);
         }
-        let result = self.pty_io(|p| p.resize(cols, rows));
-        // Force the next snapshot: the grid reflowed even if no new bytes arrived.
-        self.version.fetch_add(1, Ordering::Release);
-        result
+        self.pty_io(|p| p.resize(cols, rows))
     }
 
-    /// The current screen (scrollback + grid) rendered as text.
-    pub fn output_snapshot(&self) -> String {
-        self.vt.lock().map(|v| v.render()).unwrap_or_default()
-    }
-
-    /// The current screen as coloured cells (scrollback + grid), one row per line.
-    pub fn cell_snapshot(&self) -> Vec<Vec<Cell>> {
-        self.vt.lock().map(|v| v.render_cells()).unwrap_or_default()
-    }
-
-    /// The cursor's absolute `(line, col)` in the rendered output.
-    pub fn cursor(&self) -> (usize, usize) {
-        self.vt.lock().map(|v| v.cursor()).unwrap_or((0, 0))
+    /// A consistent frame of the current screen, scrollback, and cursor,
+    /// captured under one lock so the three can never be torn relative to
+    /// each other.
+    pub fn snapshot(&self) -> Snapshot {
+        self.vt
+            .lock()
+            .map(|v| Snapshot {
+                screen: v.screen_cells(),
+                scrollback: v.scrollback_cells(),
+                cursor: v.cursor(),
+                version: self.version.load(Ordering::Acquire),
+            })
+            .unwrap_or_else(|_| Snapshot {
+                screen: Vec::new(),
+                scrollback: Vec::new(),
+                cursor: (0, 0),
+                version: self.version.load(Ordering::Acquire),
+            })
     }
 
     /// The current window title set by the shell via OSC 0/2, if any.
@@ -193,7 +241,14 @@ fn spawn_reader<R: Read + Send + 'static>(
                 Ok(n) => {
                     let response = if let Ok(mut v) = vt.lock() {
                         v.process(&buf[..n]);
-                        v.take_response()
+                        let response = v.take_response();
+                        // Bumped while still holding the vt lock: a concurrent
+                        // `Terminal::snapshot()` either sees the grid before
+                        // this update with the old version, or after it with
+                        // the new one — never a stale version paired with
+                        // fresh cells.
+                        version.fetch_add(1, Ordering::Release);
+                        response
                     } else {
                         None
                     };
@@ -202,7 +257,6 @@ fn spawn_reader<R: Read + Send + 'static>(
                             let _ = p.write(&bytes);
                         }
                     }
-                    version.fetch_add(1, Ordering::Release);
                 }
             }
         }
