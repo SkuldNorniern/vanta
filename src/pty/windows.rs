@@ -192,16 +192,16 @@ unsafe fn try_load_conpty() -> Option<ConPtyFns> {
     if hmod.is_null() {
         return None;
     }
-    let create_ptr = unsafe { GetProcAddress(hmod, b"CreatePseudoConsole\0".as_ptr()) };
-    let resize_ptr = unsafe { GetProcAddress(hmod, b"ResizePseudoConsole\0".as_ptr()) };
-    let close_ptr = unsafe { GetProcAddress(hmod, b"ClosePseudoConsole\0".as_ptr()) };
+    let create_ptr = unsafe { GetProcAddress(hmod, c"CreatePseudoConsole".as_ptr().cast::<u8>()) };
+    let resize_ptr = unsafe { GetProcAddress(hmod, c"ResizePseudoConsole".as_ptr().cast::<u8>()) };
+    let close_ptr = unsafe { GetProcAddress(hmod, c"ClosePseudoConsole".as_ptr().cast::<u8>()) };
     if create_ptr.is_null() || resize_ptr.is_null() || close_ptr.is_null() {
         return None;
     }
     Some(ConPtyFns {
-        create: unsafe { transmute(create_ptr) },
-        resize: unsafe { transmute(resize_ptr) },
-        close: unsafe { transmute(close_ptr) },
+        create: unsafe { transmute::<*mut c_void, FnCreatePseudoConsole>(create_ptr) },
+        resize: unsafe { transmute::<*mut c_void, FnResizePseudoConsole>(resize_ptr) },
+        close: unsafe { transmute::<*mut c_void, FnClosePseudoConsole>(close_ptr) },
     })
 }
 

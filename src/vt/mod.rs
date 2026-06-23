@@ -8,121 +8,18 @@
 //! OSC 0/2 title is stored. DSR cursor-position reports (CSI 6n) are queued for
 //! write-back by the caller via [`Vt::take_response`].
 
+mod cell;
+pub use cell::{Attrs, Cell, CellKind, Color};
+
+mod width;
+
+mod grid;
+
 use std::mem;
 use std::str;
 
 const MAX_SCROLLBACK: usize = 5000;
 const TAB: usize = 8;
-
-/// A terminal colour: the slot's default, one of the 256 indexed colours, or
-/// a 24-bit RGB triple. Resolving an [`Color::Indexed`]/[`Color::Default`] to
-/// actual pixels is the renderer's job (it owns the palette/theme).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Color {
-    Default,
-    Indexed(u8),
-    Rgb(u8, u8, u8),
-}
-
-/// Text attribute bitset (bold/italic/underline/dim/blink/hidden/strike/inverse).
-/// Hand-rolled rather than pulling in a `bitflags` dependency.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub struct Attrs(u8);
-
-impl Attrs {
-    pub const BOLD: Attrs = Attrs(1 << 0);
-    pub const DIM: Attrs = Attrs(1 << 1);
-    pub const ITALIC: Attrs = Attrs(1 << 2);
-    pub const UNDERLINE: Attrs = Attrs(1 << 3);
-    pub const BLINK: Attrs = Attrs(1 << 4);
-    pub const INVERSE: Attrs = Attrs(1 << 5);
-    pub const HIDDEN: Attrs = Attrs(1 << 6);
-    pub const STRIKE: Attrs = Attrs(1 << 7);
-
-    pub fn contains(self, flag: Attrs) -> bool {
-        self.0 & flag.0 == flag.0
-    }
-
-    fn set(&mut self, flag: Attrs, on: bool) {
-        if on {
-            self.0 |= flag.0;
-        } else {
-            self.0 &= !flag.0;
-        }
-    }
-}
-
-/// The content of one grid position.
-#[derive(Clone, PartialEq, Debug)]
-pub enum CellKind {
-    /// Blank, never written (or erased back to blank).
-    Empty,
-    /// A single scalar — the hot path; no allocation.
-    Char(char),
-    /// A base character plus combining marks / ZWJ-joined / paired scalars
-    /// that render as one grapheme (e.g. `🧑‍💻`, NFD Korean, flags).
-    Cluster(Box<str>),
-    /// The right half of a width-2 glyph. Carries no text of its own; the
-    /// renderer and text extraction skip it.
-    Continuation,
-}
-
-/// One screen position: a grapheme cluster plus its pen (colours + attributes).
-#[derive(Clone, PartialEq, Debug)]
-pub struct Cell {
-    pub kind: CellKind,
-    /// Display columns occupied by the leading cell: 0, 1, or 2. Continuation
-    /// cells carry 0 (their leading cell carries the real width).
-    pub width: u8,
-    pub fg: Color,
-    pub bg: Color,
-    /// Colour of the underline itself (SGR 58/59), independent of `fg`. Used
-    /// by LSP-style squiggly diagnostics in modern editors/terminals.
-    /// `Color::Default` means "same as `fg`".
-    pub underline_color: Color,
-    pub attrs: Attrs,
-}
-
-impl Cell {
-    fn blank() -> Self {
-        Self {
-            kind: CellKind::Empty,
-            width: 1,
-            fg: Color::Default,
-            bg: Color::Default,
-            underline_color: Color::Default,
-            attrs: Attrs::default(),
-        }
-    }
-
-    fn continuation() -> Self {
-        Self {
-            kind: CellKind::Continuation,
-            width: 0,
-            fg: Color::Default,
-            bg: Color::Default,
-            underline_color: Color::Default,
-            attrs: Attrs::default(),
-        }
-    }
-
-    /// The cell's text for simple single-scalar cases; clusters yield their
-    /// first scalar. Prefer [`Cell::kind`] directly when the full grapheme
-    /// (e.g. a `Cluster`) matters, such as for copy/paste.
-    pub fn ch(&self) -> char {
-        match &self.kind {
-            CellKind::Char(c) => *c,
-            CellKind::Cluster(s) => s.chars().next().unwrap_or(' '),
-            CellKind::Empty | CellKind::Continuation => ' ',
-        }
-    }
-}
-
-impl Default for Cell {
-    fn default() -> Self {
-        Self::blank()
-    }
-}
 
 /// The current drawing pen applied to newly written glyphs.
 #[derive(Clone, Copy)]
@@ -142,14 +39,17 @@ impl Pen {
             attrs: Attrs(0),
         }
     }
+
     fn reset(&mut self) {
         *self = Self::new();
     }
+
     /// A single-scalar cell painted with the current pen, width derived from
     /// [`width::char_width`].
     fn cell(&self, ch: char) -> Cell {
         self.cell_with_width(ch, width::char_width(ch).max(1))
     }
+
     fn cell_with_width(&self, ch: char, w: u8) -> Cell {
         Cell {
             kind: CellKind::Char(ch),
@@ -160,70 +60,6 @@ impl Pen {
             attrs: self.attrs,
         }
     }
-}
-
-/// Hand-rolled, conservative Unicode display width — no `unicode-width`
-/// dependency. Ranges are approximate; exotic clusters may render at a
-/// slightly wrong width, but the original text is always preserved for copy.
-mod width {
-    /// `0`, `1`, or `2` display columns for `c`.
-    pub fn char_width(c: char) -> u8 {
-        let u = c as u32;
-        if is_zero_width(u) {
-            0
-        } else if is_wide(u) {
-            2
-        } else {
-            1
-        }
-    }
-
-    fn is_zero_width(u: u32) -> bool {
-        matches!(u,
-            0x0300..=0x036F   // combining diacritical marks
-            | 0x0483..=0x0489 // combining cyrillic
-            | 0x0591..=0x05BD // hebrew points (approx)
-            | 0x064B..=0x065F // arabic combining marks (approx)
-            | 0x1AB0..=0x1AFF // combining diacritical marks extended
-            | 0x1DC0..=0x1DFF // combining diacritical marks supplement
-            | 0x20D0..=0x20FF // combining diacritical marks for symbols (incl. keycap U+20E3)
-            | 0xFE00..=0xFE0F // variation selectors (incl. VS15/VS16)
-            | 0xFE20..=0xFE2F // combining half marks
-            | 0x200B          // zero width space
-            | 0x200C          // zero width non-joiner
-            | 0x200D          // zero width joiner
-            | 0x2060          // word joiner
-            | 0xFEFF          // BOM / zero width no-break space
-            // Hangul conjoining Jamo: lead/vowel/trail combine into one
-            // syllable cluster rather than each occupying their own cell.
-            | 0x1160..=0x11FF // vowels + trailing consonants (lead handled as wide below)
-        )
-    }
-
-    fn is_wide(u: u32) -> bool {
-        matches!(u,
-            0x1100..=0x115F   // hangul jamo leading consonants (cluster anchor)
-            | 0x3000..=0x303F // CJK symbols and punctuation
-            | 0x3040..=0x30FF // hiragana, katakana
-            | 0x3130..=0x318F // hangul compatibility jamo
-            | 0x3400..=0x4DBF // CJK unified ideographs extension A
-            | 0x4E00..=0x9FFF // CJK unified ideographs
-            | 0xA960..=0xA97F // hangul jamo extended-A
-            | 0xAC00..=0xD7A3 // hangul syllables (precomposed, NFC)
-            | 0xD7B0..=0xD7FF // hangul jamo extended-B
-            | 0xF900..=0xFAFF // CJK compatibility ideographs
-            | 0xFF00..=0xFF60 // fullwidth forms
-            | 0xFFE0..=0xFFE6 // fullwidth signs
-            | 0x1F300..=0x1FAFF // misc symbols/pictographs, emoji
-            | 0x2600..=0x27BF // misc symbols / dingbats (approximate: many common emoji live here)
-        )
-    }
-}
-
-/// `U+1F1E6..=U+1F1FF` — a single regional indicator letter; two in a row
-/// form one flag glyph (handled in [`Vt::put`]).
-fn is_regional_indicator(c: char) -> bool {
-    matches!(c as u32, 0x1F1E6..=0x1F1FF)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -292,6 +128,9 @@ pub struct Vt {
 
     // ── DEC cursor-visibility mode (DECTCEM, mode 25) ──────────────────────
     cursor_visible: bool,
+
+    // ── DEC mode 2004: bracketed paste ────────────────────────────────────
+    bracketed_paste: bool,
 }
 
 impl Vt {
@@ -326,6 +165,7 @@ impl Vt {
             osc_buf: String::new(),
             title: None,
             cursor_visible: true,
+            bracketed_paste: false,
         }
     }
 
@@ -368,6 +208,16 @@ impl Vt {
         self.cursor_visible
     }
 
+    /// Whether the alternate screen is currently active (DECSET 47 / 1049).
+    pub fn on_alt_screen(&self) -> bool {
+        self.alt_active
+    }
+
+    /// Whether bracketed paste mode is enabled (DECSET 2004).
+    pub fn bracketed_paste_enabled(&self) -> bool {
+        self.bracketed_paste
+    }
+
     /// Decode `buf` as UTF-8, feeding complete scalars to [`Self::feed_char`].
     /// Invalid byte sequences yield one U+FFFD per maximal invalid subpart;
     /// an incomplete trailing sequence is stashed in `pending_utf8`.
@@ -407,27 +257,22 @@ impl Vt {
             State::Ground => self.ground(ch),
             State::Esc => self.esc(ch),
             State::Csi => self.csi(ch),
-            State::Osc => {
-                match ch {
-                    '\u{7}' => {
-                        // BEL terminates OSC
-                        self.finish_osc();
-                        self.state = State::Ground;
-                    }
-                    '\u{1b}' => {
-                        // Possible start of ST (`ESC \`); the next byte decides.
-                        self.finish_osc();
-                        self.state = State::OscEsc;
-                    }
-                    _ => self.osc_buf.push(ch),
+            State::Osc => match ch {
+                '\u{7}' => {
+                    self.finish_osc();
+                    self.state = State::Ground;
                 }
-            }
+                '\u{1b}' => {
+                    self.finish_osc();
+                    self.state = State::OscEsc;
+                }
+                _ => self.osc_buf.push(ch),
+            },
             State::OscEsc => {
                 if ch == '\\' {
-                    // ST complete — both bytes consumed, nothing leaks to Ground.
                     self.state = State::Ground;
                 } else {
-                    // Not ST: ESC aborted the OSC: start a fresh escape sequence.
+                    // Not ST: ESC aborted the OSC — start a fresh escape sequence.
                     self.state = State::Ground;
                     self.esc(ch);
                 }
@@ -465,7 +310,7 @@ impl Vt {
                 self.break_clustering();
                 self.cx = (((self.cx / TAB) + 1) * TAB).min(self.cols - 1);
             }
-            c if (c as u32) < 0x20 || c == '\u{7f}' => self.break_clustering(), // other controls: ignore
+            c if (c as u32) < 0x20 || c == '\u{7f}' => self.break_clustering(),
             c => self.put(c),
         }
     }
@@ -530,7 +375,7 @@ impl Vt {
                 self.params.push(self.cur_param.take().unwrap_or(0));
             }
             '?' => self.csi_private = true,
-            '>' | '!' | '=' => {} // other private markers: ignore
+            '>' | '!' | '=' => {}
             '\u{40}'..='\u{7e}' => {
                 if let Some(p) = self.cur_param.take() {
                     self.params.push(p);
@@ -550,7 +395,6 @@ impl Vt {
     }
 
     fn dispatch_csi(&mut self, final_ch: char) {
-        // Route DEC private sequences (CSI ? ... h/l) separately.
         if self.csi_private {
             match final_ch {
                 'h' => {
@@ -604,16 +448,12 @@ impl Vt {
                 self.cx = 0;
                 self.cy = 0;
             }
-            // Save / restore cursor (abbreviated DECSC/DECRC)
             's' => self.decsc(),
             'u' => self.decrc(),
-            // Insert / delete lines
             'L' => self.insert_lines(self.param(0, 1) as usize),
             'M' => self.delete_lines(self.param(0, 1) as usize),
-            // Insert / delete characters
             '@' => self.insert_chars(self.param(0, 1) as usize),
             'P' => self.delete_chars(self.param(0, 1) as usize),
-            // Scroll region up / down (CSI S / CSI T)
             'S' => {
                 let n = self.param(0, 1) as usize;
                 for _ in 0..n {
@@ -653,11 +493,11 @@ impl Vt {
 
     fn dispatch_decset(&mut self, mode: u32) {
         match mode {
-            1 => {} // DECCKM: application cursor keys — track if needed for input encoding
+            1 => {}
             25 => self.cursor_visible = true,
             47 => self.enter_alt_screen(false),
             1049 => self.enter_alt_screen(true),
-            2004 => {} // bracketed paste mode — noted but not emitted by Vt
+            2004 => self.bracketed_paste = true,
             _ => {}
         }
     }
@@ -668,12 +508,11 @@ impl Vt {
             25 => self.cursor_visible = false,
             47 => self.exit_alt_screen(false),
             1049 => self.exit_alt_screen(true),
-            2004 => {}
+            2004 => self.bracketed_paste = false,
             _ => {}
         }
     }
 
-    /// Save cursor position and pen (DECSC / ESC 7).
     fn decsc(&mut self) {
         self.saved_cx = self.cx;
         self.saved_cy = self.cy;
@@ -681,7 +520,6 @@ impl Vt {
         self.has_saved_cursor = true;
     }
 
-    /// Restore cursor position and pen (DECRC / ESC 8).
     fn decrc(&mut self) {
         if self.has_saved_cursor {
             self.cx = self.saved_cx.min(self.cols - 1);
@@ -690,8 +528,6 @@ impl Vt {
         }
     }
 
-    /// Switch to the alternate screen. If `save_cursor` is true (DECSET 1049)
-    /// the current cursor is saved and will be restored on exit.
     fn enter_alt_screen(&mut self, save_cursor: bool) {
         if self.alt_active {
             return;
@@ -699,7 +535,6 @@ impl Vt {
         if save_cursor {
             self.decsc();
         }
-        // Blank the alt cells (in case we've been here before).
         for row in &mut self.alt_cells {
             for cell in row.iter_mut() {
                 *cell = Cell::blank();
@@ -715,7 +550,6 @@ impl Vt {
         self.alt_active = true;
     }
 
-    /// Return to the normal screen.
     fn exit_alt_screen(&mut self, restore_cursor: bool) {
         if !self.alt_active {
             return;
@@ -731,58 +565,6 @@ impl Vt {
         }
     }
 
-    /// Insert `n` blank lines at the cursor row (within the scroll region).
-    fn insert_lines(&mut self, n: usize) {
-        if self.cy < self.scroll_top || self.cy > self.scroll_bottom {
-            return;
-        }
-        let region_size = self.scroll_bottom - self.cy + 1;
-        let n = n.min(region_size);
-        for _ in 0..n {
-            self.screen.remove(self.scroll_bottom);
-            self.screen.insert(self.cy, vec![Cell::blank(); self.cols]);
-        }
-        self.cx = 0;
-    }
-
-    /// Delete `n` lines at the cursor row (within the scroll region).
-    fn delete_lines(&mut self, n: usize) {
-        if self.cy < self.scroll_top || self.cy > self.scroll_bottom {
-            return;
-        }
-        let region_size = self.scroll_bottom - self.cy + 1;
-        let n = n.min(region_size);
-        for _ in 0..n {
-            self.screen.remove(self.cy);
-            self.screen
-                .insert(self.scroll_bottom, vec![Cell::blank(); self.cols]);
-        }
-        self.cx = 0;
-    }
-
-    /// Insert `n` blank characters at the cursor column (shift right, drop overflow).
-    fn insert_chars(&mut self, n: usize) {
-        let row = &mut self.screen[self.cy];
-        let n = n.min(self.cols - self.cx);
-        row[self.cx..].rotate_right(n);
-        let blank = Cell::blank();
-        for cell in &mut row[self.cx..self.cx + n] {
-            *cell = blank.clone();
-        }
-    }
-
-    /// Delete `n` characters at the cursor column (shift left, fill right with blank).
-    fn delete_chars(&mut self, n: usize) {
-        let row = &mut self.screen[self.cy];
-        let n = n.min(self.cols - self.cx);
-        row[self.cx..].rotate_left(n);
-        let blank = Cell::blank();
-        for cell in &mut row[self.cols - n..] {
-            *cell = blank.clone();
-        }
-    }
-
-    /// Apply an SGR sequence (`\x1b[...m`) to the current pen.
     fn sgr(&mut self) {
         if self.params.is_empty() {
             self.pen.reset();
@@ -818,20 +600,20 @@ impl Vt {
                 100..=107 => self.pen.bg = Color::Indexed((p - 100 + 8) as u8),
                 49 => self.pen.bg = Color::Default,
                 38 => {
-                    if let Some((c, used)) = parse_extended(&self.params[i + 1..]) {
+                    if let Some((c, used)) = grid::parse_extended(&self.params[i + 1..]) {
                         self.pen.fg = c;
                         i += used;
                     }
                 }
                 58 => {
-                    if let Some((c, used)) = parse_extended(&self.params[i + 1..]) {
+                    if let Some((c, used)) = grid::parse_extended(&self.params[i + 1..]) {
                         self.pen.underline_color = c;
                         i += used;
                     }
                 }
                 59 => self.pen.underline_color = Color::Default,
                 48 => {
-                    if let Some((c, used)) = parse_extended(&self.params[i + 1..]) {
+                    if let Some((c, used)) = grid::parse_extended(&self.params[i + 1..]) {
                         self.pen.bg = c;
                         i += used;
                     }
@@ -841,343 +623,11 @@ impl Vt {
             i += 1;
         }
     }
-
-    fn erase_display(&mut self, mode: u32) {
-        let blank = self.pen.cell(' ');
-        match mode {
-            0 => {
-                // cursor → end of screen
-                for c in self.cx..self.cols {
-                    self.screen[self.cy][c] = blank.clone();
-                }
-                for r in (self.cy + 1)..self.rows {
-                    for c in 0..self.cols {
-                        self.screen[r][c] = blank.clone();
-                    }
-                }
-            }
-            1 => {
-                for r in 0..self.cy {
-                    for c in 0..self.cols {
-                        self.screen[r][c] = blank.clone();
-                    }
-                }
-                for c in 0..=self.cx.min(self.cols - 1) {
-                    self.screen[self.cy][c] = blank.clone();
-                }
-            }
-            _ => {
-                // 2 (and 3): clear whole screen.
-                for row in &mut self.screen {
-                    for c in row.iter_mut() {
-                        *c = blank.clone();
-                    }
-                }
-                if mode == 3 {
-                    self.scrollback.clear();
-                }
-            }
-        }
-    }
-
-    fn erase_line(&mut self, mode: u32) {
-        let blank = self.pen.cell(' ');
-        let row = &mut self.screen[self.cy];
-        match mode {
-            0 => {
-                for cell in &mut row[self.cx..self.cols] {
-                    *cell = blank.clone();
-                }
-            }
-            1 => {
-                let end = self.cx.min(self.cols - 1);
-                for cell in &mut row[0..=end] {
-                    *cell = blank.clone();
-                }
-            }
-            _ => {
-                for c in row.iter_mut() {
-                    *c = blank.clone();
-                }
-            }
-        }
-    }
-
-    /// Write one decoded scalar to the grid: combining marks merge into the
-    /// previous cell's cluster, ZWJ runs and regional-indicator pairs merge
-    /// into one cell, and width-2 glyphs occupy a leading + continuation cell.
-    fn put(&mut self, ch: char) {
-        if let Some((row, col)) = self.pending_zwj.take() {
-            if row == self.cy {
-                self.merge_into_cluster(row, col, ch);
-                if ch == '\u{200d}' {
-                    self.pending_zwj = Some((row, col));
-                }
-                return;
-            }
-        }
-
-        let w = width::char_width(ch);
-        if w == 0 {
-            self.append_combining(ch);
-            return;
-        }
-
-        if is_regional_indicator(ch) {
-            if let Some((row, col)) = self.pending_regional.take() {
-                if row == self.cy && col + 1 == self.cx {
-                    self.merge_into_cluster(row, col, ch);
-                    self.screen[row][col].width = 2;
-                    if col + 1 < self.cols {
-                        self.screen[row][col + 1] = Cell::continuation();
-                    }
-                    self.cx = (self.cx + 1).min(self.cols);
-                    return;
-                }
-            }
-            self.write_plain(ch, 1);
-            self.pending_regional = Some((self.cy, self.cx - 1));
-            return;
-        }
-        self.pending_regional = None;
-
-        self.write_plain(ch, w);
-    }
-
-    /// Append a width-0 scalar (combining mark, VS15/16, ZWJ, ...) onto the
-    /// cluster of the cell immediately before the cursor. No base → dropped
-    /// (fallback policy: never corrupt the grid for a stray combining mark).
-    fn append_combining(&mut self, ch: char) {
-        if self.cx == 0 {
-            self.pending_zwj = None;
-            return;
-        }
-        let mut col = self.cx - 1;
-        if matches!(self.screen[self.cy][col].kind, CellKind::Continuation) && col > 0 {
-            col -= 1;
-        }
-        self.merge_into_cluster(self.cy, col, ch);
-        // VS16 (U+FE0F) forces emoji presentation on the preceding character.
-        // Widen the base cell from 1 → 2 and insert a continuation cell so the
-        // glyph occupies the correct two columns (e.g. `1️⃣` = '1' + VS16 + U+20E3).
-        if ch == '\u{FE0F}' && self.screen[self.cy][col].width == 1 && col + 1 < self.cols {
-            self.screen[self.cy][col].width = 2;
-            self.screen[self.cy][col + 1] = Cell::continuation();
-            self.cx = col + 2;
-        }
-        self.pending_zwj = if ch == '\u{200d}' {
-            Some((self.cy, col))
-        } else {
-            None
-        };
-    }
-
-    fn merge_into_cluster(&mut self, row: usize, col: usize, ch: char) {
-        let cell = &mut self.screen[row][col];
-        match &cell.kind {
-            CellKind::Char(c) => {
-                let mut s = String::with_capacity(c.len_utf8() + ch.len_utf8());
-                s.push(*c);
-                s.push(ch);
-                cell.kind = CellKind::Cluster(s.into_boxed_str());
-            }
-            CellKind::Cluster(s) => {
-                let mut owned = s.to_string();
-                owned.push(ch);
-                cell.kind = CellKind::Cluster(owned.into_boxed_str());
-            }
-            CellKind::Empty | CellKind::Continuation => {}
-        }
-    }
-
-    /// Write `ch` as a new leading cell of display width `w` at the cursor,
-    /// wrapping first if it doesn't fit and clearing any wide-glyph half it
-    /// overwrites.
-    fn write_plain(&mut self, ch: char, w: u8) {
-        if self.cx >= self.cols || (w == 2 && self.cx + 1 >= self.cols) {
-            self.cx = 0;
-            self.linefeed();
-        }
-        self.break_wide_at(self.cy, self.cx);
-        if w == 2 && self.cx + 1 < self.cols {
-            self.break_wide_at(self.cy, self.cx + 1);
-        }
-        self.screen[self.cy][self.cx] = self.pen.cell_with_width(ch, w);
-        if w == 2 && self.cx + 1 < self.cols {
-            self.screen[self.cy][self.cx + 1] = Cell::continuation();
-            self.cx += 2;
-        } else {
-            self.cx += 1;
-        }
-    }
-
-    /// Clear whichever half of a wide-glyph pair is about to be partially
-    /// overwritten at `(row, col)`, so a wide glyph is never left half-erased.
-    fn break_wide_at(&mut self, row: usize, col: usize) {
-        if col >= self.cols {
-            return;
-        }
-        if matches!(self.screen[row][col].kind, CellKind::Continuation) {
-            if col > 0 {
-                self.screen[row][col - 1] = Cell::blank();
-            }
-        } else if self.screen[row][col].width == 2 && col + 1 < self.cols {
-            self.screen[row][col + 1] = Cell::blank();
-        }
-    }
-
-    fn linefeed(&mut self) {
-        if self.cy == self.scroll_bottom {
-            self.scroll_up();
-        } else {
-            self.cy = (self.cy + 1).min(self.rows - 1);
-        }
-    }
-
-    /// Scroll the scroll region up by one line. The top line is pushed to
-    /// scrollback only when on the normal screen and the region starts at row 0.
-    fn scroll_up(&mut self) {
-        let top = self.screen.remove(self.scroll_top);
-        if !self.alt_active && self.scroll_top == 0 {
-            self.scrollback.push(top);
-            if self.scrollback.len() > MAX_SCROLLBACK {
-                let excess = self.scrollback.len() - MAX_SCROLLBACK;
-                self.scrollback.drain(0..excess);
-            }
-        }
-        self.screen
-            .insert(self.scroll_bottom, vec![Cell::blank(); self.cols]);
-    }
-
-    /// Scroll the scroll region down by one line (used by reverse-index / CSI T).
-    fn scroll_down(&mut self) {
-        self.screen.remove(self.scroll_bottom);
-        self.screen
-            .insert(self.scroll_top, vec![Cell::blank(); self.cols]);
-    }
-
-    /// Resize the grid, preserving overlapping content; clamps the cursor and
-    /// resets the scroll region to the full new screen.
-    pub fn resize(&mut self, cols: usize, rows: usize) {
-        let cols = cols.max(1);
-        let rows = rows.max(1);
-        if cols == self.cols && rows == self.rows {
-            return;
-        }
-        let mut next = vec![vec![Cell::blank(); cols]; rows];
-        let copy_cols = cols.min(self.cols);
-        for (dst_row, src_row) in next
-            .iter_mut()
-            .zip(self.screen.iter())
-            .take(rows.min(self.rows))
-        {
-            dst_row[..copy_cols].clone_from_slice(&src_row[..copy_cols]);
-        }
-        self.screen = next;
-        // Resize alt buffer to match; don't preserve content (alt screen resets on entry anyway).
-        self.alt_cells = vec![vec![Cell::blank(); cols]; rows];
-        self.cols = cols;
-        self.rows = rows;
-        self.cx = self.cx.min(cols - 1);
-        self.cy = self.cy.min(rows - 1);
-        self.scroll_top = 0;
-        self.scroll_bottom = rows - 1;
-    }
-
-    /// The cursor's absolute position in the rendered output: `(line, col)`,
-    /// where `line` counts scrollback rows then screen rows.
-    pub fn cursor(&self) -> (usize, usize) {
-        (self.scrollback.len() + self.cy, self.cx)
-    }
-
-    /// The full visible text: scrollback then the screen, trailing spaces trimmed.
-    pub fn render(&self) -> String {
-        let mut out = String::new();
-        for line in &self.scrollback {
-            out.push_str(&trim_row(line));
-            out.push('\n');
-        }
-        for (i, row) in self.screen.iter().enumerate() {
-            out.push_str(&trim_row(row));
-            if i + 1 < self.screen.len() {
-                out.push('\n');
-            }
-        }
-        out
-    }
-
-    /// The full visible grid as coloured cells: scrollback then screen, one
-    /// `Vec<Cell>` per line with trailing blank cells trimmed.
-    pub fn render_cells(&self) -> Vec<Vec<Cell>> {
-        let mut out = self.scrollback_cells();
-        out.extend(self.screen_cells());
-        out
-    }
-
-    /// The visible screen only (no scrollback), one `Vec<Cell>` per line with
-    /// trailing blank cells trimmed.
-    pub fn screen_cells(&self) -> Vec<Vec<Cell>> {
-        self.screen.iter().map(|row| trim_cells(row)).collect()
-    }
-
-    /// Scrollback history only (no visible screen), one `Vec<Cell>` per line
-    /// with trailing blank cells trimmed.
-    pub fn scrollback_cells(&self) -> Vec<Vec<Cell>> {
-        self.scrollback.iter().map(|row| trim_cells(row)).collect()
-    }
-}
-
-/// Parse the tail of a `38`/`48` SGR: `5;<idx>` (256-colour) or `2;<r>;<g>;<b>`
-/// (truecolour). Returns the colour and how many params it consumed.
-fn parse_extended(rest: &[u32]) -> Option<(Color, usize)> {
-    match rest.first().copied() {
-        Some(5) => rest.get(1).map(|&idx| (Color::Indexed(idx as u8), 2)),
-        Some(2) => {
-            let r = *rest.get(1)? as u8;
-            let g = *rest.get(2)? as u8;
-            let b = *rest.get(3)? as u8;
-            Some((Color::Rgb(r, g, b), 4))
-        }
-        _ => None,
-    }
-}
-
-fn is_blank(cell: &Cell) -> bool {
-    match &cell.kind {
-        CellKind::Empty => true,
-        CellKind::Char(' ') => cell.bg == Color::Default,
-        _ => false,
-    }
-}
-
-fn trim_end(row: &[Cell]) -> usize {
-    let mut end = row.len();
-    while end > 0 && is_blank(&row[end - 1]) {
-        end -= 1;
-    }
-    end
-}
-
-fn trim_row(row: &[Cell]) -> String {
-    let mut out = String::new();
-    for cell in &row[..trim_end(row)] {
-        match &cell.kind {
-            CellKind::Empty => out.push(' '),
-            CellKind::Char(c) => out.push(*c),
-            CellKind::Cluster(s) => out.push_str(s),
-            CellKind::Continuation => {}
-        }
-    }
-    out
-}
-
-fn trim_cells(row: &[Cell]) -> Vec<Cell> {
-    row[..trim_end(row)].to_vec()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Cell, CellKind, Color, Vt};
+    use super::{Attrs, Cell, CellKind, Color, Vt};
 
     fn render(input: &str) -> String {
         let mut vt = Vt::new(20, 5);
@@ -1272,7 +722,6 @@ mod tests {
 
     #[test]
     fn sgr_text_attributes() {
-        use super::Attrs;
         let mut vt = Vt::new(20, 2);
         vt.process("\u{1b}[1;3;4;9mX\u{1b}[22;23;24;29mY".as_bytes());
         let cells = vt.render_cells();
@@ -1295,27 +744,21 @@ mod tests {
 
     #[test]
     fn scroll_region_confines_scroll() {
-        // 5-row screen, scroll region rows 2–4 (1-based).
-        // Writing enough lines to scroll should not push row 0 into scrollback.
         let mut vt = Vt::new(10, 5);
-        vt.process("top\r\n".as_bytes()); // row 0: "top"
-        vt.process("\x1b[2;5r".as_bytes()); // set region rows 2-5
-        vt.process("\x1b[2;1H".as_bytes()); // cursor to row 2
-        vt.process("A\r\nB\r\nC\r\nD".as_bytes()); // fills region, should scroll within it
+        vt.process("top\r\n".as_bytes());
+        vt.process("\x1b[2;5r".as_bytes());
+        vt.process("\x1b[2;1H".as_bytes());
+        vt.process("A\r\nB\r\nC\r\nD".as_bytes());
         let out = vt.render();
-        // row 0 was outside the region and must still be "top"
         assert!(out.lines().next() == Some("top"));
-        // scrollback should be empty (region scroll doesn't touch scrollback)
         assert_eq!(vt.scrollback.len(), 0);
     }
 
     #[test]
     fn scroll_region_resets_on_decstbm() {
         let mut vt = Vt::new(10, 5);
-        vt.process("\x1b[2;4r".as_bytes()); // region 2-4
-        // Reset region (CSI r with no params → defaults to full screen)
+        vt.process("\x1b[2;4r".as_bytes());
         vt.process("\x1b[r".as_bytes());
-        // Linefeed at bottom should now push to scrollback.
         vt.process("a\r\nb\r\nc\r\nd\r\ne\r\nf".as_bytes());
         assert!(!vt.scrollback.is_empty());
     }
@@ -1323,16 +766,12 @@ mod tests {
     #[test]
     fn reverse_index_scrolls_within_region() {
         let mut vt = Vt::new(10, 4);
-        // Set region rows 2-4 (1-based), write something at the top of region.
         vt.process("\x1b[2;4r".as_bytes());
-        vt.process("\x1b[2;1HA".as_bytes()); // row 1 (0-based), col 0: 'A'
-        // Reverse index at scroll_top (row 1) must scroll region down (insert blank above 'A').
-        vt.process("\x1b[2;1H".as_bytes()); // cursor back to region top
-        vt.process("\x1bM".as_bytes()); // ESC M = reverse index
+        vt.process("\x1b[2;1HA".as_bytes());
+        vt.process("\x1b[2;1H".as_bytes());
+        vt.process("\x1bM".as_bytes());
         let cells = vt.render_cells();
-        // 'A' should have moved to row 2 (one row down from region top).
         assert_eq!(cells[2][0].ch(), 'A');
-        // Row 1 (newly inserted blank at region top) should be empty.
         assert!(cells[1].is_empty());
     }
 
@@ -1340,35 +779,31 @@ mod tests {
     fn insert_delete_lines() {
         let mut vt = Vt::new(10, 4);
         vt.process("A\r\nB\r\nC\r\nD".as_bytes());
-        vt.process("\x1b[2;1H".as_bytes()); // cursor to row 1 (0-based)
-        vt.process("\x1b[1L".as_bytes()); // insert 1 line
+        vt.process("\x1b[2;1H".as_bytes());
+        vt.process("\x1b[1L".as_bytes());
         let cells = vt.render_cells();
         assert_eq!(cells[0][0].ch(), 'A');
-        assert!(cells[1].is_empty()); // blank inserted at row 1
+        assert!(cells[1].is_empty());
         assert_eq!(cells[2][0].ch(), 'B');
-        // 'D' was at the scroll-region bottom and got dropped; 'C' shifted down into row 3.
         assert_eq!(cells[3][0].ch(), 'C');
-        // Now test delete line.
-        vt.process("\x1b[2;1H".as_bytes()); // cursor to row 1 (blank)
-        vt.process("\x1b[1M".as_bytes()); // delete 1 line
+        vt.process("\x1b[2;1H".as_bytes());
+        vt.process("\x1b[1M".as_bytes());
         let cells = vt.render_cells();
         assert_eq!(cells[0][0].ch(), 'A');
-        assert_eq!(cells[1][0].ch(), 'B'); // blank removed, B moved up
+        assert_eq!(cells[1][0].ch(), 'B');
     }
 
     #[test]
     fn insert_delete_chars() {
         let mut vt = Vt::new(10, 2);
         vt.process("ABCDE".as_bytes());
-        vt.process("\x1b[1;3H".as_bytes()); // cursor to col 2 (1-based)
-        vt.process("\x1b[1@".as_bytes()); // insert 1 char
+        vt.process("\x1b[1;3H".as_bytes());
+        vt.process("\x1b[1@".as_bytes());
         let cells = vt.render_cells();
-        // "ABCDE" → "AB CDE" with E dropped (shifted off right)
         assert_eq!(cells[0][0].ch(), 'A');
         assert_eq!(cells[0][1].ch(), 'B');
         assert!(cells[0][2].ch() == ' ');
         assert_eq!(cells[0][3].ch(), 'C');
-        // Now delete 1 char at col 2.
         vt.process("\x1b[1;3H".as_bytes());
         vt.process("\x1b[1P".as_bytes());
         let cells = vt.render_cells();
@@ -1379,44 +814,42 @@ mod tests {
     fn alternate_screen_enter_exit() {
         let mut vt = Vt::new(10, 3);
         vt.process("normal".as_bytes());
-        vt.process("\x1b[?1049h".as_bytes()); // enter alt screen
+        vt.process("\x1b[?1049h".as_bytes());
         let cells_alt = vt.render_cells();
-        assert!(cells_alt[0].is_empty()); // alt screen starts blank
+        assert!(cells_alt[0].is_empty());
         vt.process("alt".as_bytes());
-        vt.process("\x1b[?1049l".as_bytes()); // exit alt screen
+        vt.process("\x1b[?1049l".as_bytes());
         let cells_normal = vt.render_cells();
-        assert_eq!(cells_normal[0][0].ch(), 'n'); // "normal" restored
+        assert_eq!(cells_normal[0][0].ch(), 'n');
     }
 
     #[test]
     fn alternate_screen_no_scrollback() {
         let mut vt = Vt::new(4, 2);
-        vt.process("\x1b[?1049h".as_bytes()); // alt screen
-        // Write enough lines to scroll.
+        vt.process("\x1b[?1049h".as_bytes());
         vt.process("A\r\nB\r\nC".as_bytes());
         let sb_len = vt.scrollback.len();
-        vt.process("\x1b[?1049l".as_bytes()); // exit; normal scrollback restored, not alt
-        // alt screen scroll should not have polluted normal scrollback.
+        vt.process("\x1b[?1049l".as_bytes());
         assert_eq!(sb_len, 0);
     }
 
     #[test]
     fn save_restore_cursor() {
         let mut vt = Vt::new(20, 5);
-        vt.process("\x1b[3;5H".as_bytes()); // cursor to row 2, col 4
-        vt.process("\x1b7".as_bytes()); // ESC 7 = DECSC
-        vt.process("\x1b[1;1H".as_bytes()); // move cursor away
-        vt.process("\x1b8".as_bytes()); // ESC 8 = DECRC
+        vt.process("\x1b[3;5H".as_bytes());
+        vt.process("\x1b7".as_bytes());
+        vt.process("\x1b[1;1H".as_bytes());
+        vt.process("\x1b8".as_bytes());
         assert_eq!(vt.cursor(), (vt.scrollback.len() + 2, 4));
     }
 
     #[test]
     fn dsr_cursor_position_report() {
         let mut vt = Vt::new(20, 5);
-        vt.process("\x1b[2;4H".as_bytes()); // cursor to row 1, col 3 (0-based)
-        vt.process("\x1b[6n".as_bytes()); // CSI 6n = CPR request
+        vt.process("\x1b[2;4H".as_bytes());
+        vt.process("\x1b[6n".as_bytes());
         let resp = vt.take_response().unwrap();
-        assert_eq!(resp, b"\x1b[2;4R"); // 1-based: row 2, col 4
+        assert_eq!(resp, b"\x1b[2;4R");
     }
 
     #[test]
@@ -1429,7 +862,6 @@ mod tests {
     #[test]
     fn osc_st_terminator_consumes_both_bytes() {
         let mut vt = Vt::new(20, 2);
-        // ST is ESC \ — neither byte should leak through as printable text.
         vt.process(b"\x1b]0;title\x1b\\X");
         assert_eq!(vt.title(), Some("title"));
         assert_eq!(vt.render().lines().next(), Some("X"));
@@ -1438,8 +870,6 @@ mod tests {
     #[test]
     fn osc_aborted_by_non_st_escape_starts_fresh_sequence() {
         let mut vt = Vt::new(20, 2);
-        // ESC not followed by `\` aborts the OSC and begins a new sequence
-        // (here ESC M = reverse index) instead of leaking either byte.
         vt.process(b"\x1b]0;title\x1bMX");
         assert_eq!(vt.title(), Some("title"));
         assert_eq!(vt.render().lines().next(), Some("X"));
@@ -1449,9 +879,9 @@ mod tests {
     fn cursor_visibility_toggle() {
         let mut vt = Vt::new(20, 2);
         assert!(vt.cursor_visible());
-        vt.process(b"\x1b[?25l"); // hide cursor
+        vt.process(b"\x1b[?25l");
         assert!(!vt.cursor_visible());
-        vt.process(b"\x1b[?25h"); // show cursor
+        vt.process(b"\x1b[?25h");
         assert!(vt.cursor_visible());
     }
 
@@ -1592,8 +1022,6 @@ mod tests {
 
     #[test]
     fn keycap_sequence_renders_width_two() {
-        // `1️⃣` = U+0031 DIGIT ONE + U+FE0F VS16 + U+20E3 COMBINING ENCLOSING KEYCAP
-        // VS16 forces emoji presentation → the whole cluster must occupy 2 columns.
         let mut vt = Vt::new(20, 2);
         vt.process("1\u{FE0F}\u{20E3}".as_bytes());
         let cells = vt.render_cells();
@@ -1607,7 +1035,6 @@ mod tests {
 
     #[test]
     fn keycap_followed_by_char_places_correctly() {
-        // After the 2-column keycap, the next character should land at col 2.
         let mut vt = Vt::new(20, 2);
         vt.process("1\u{FE0F}\u{20E3}X".as_bytes());
         let cells = vt.render_cells();

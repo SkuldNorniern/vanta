@@ -40,6 +40,10 @@ pub struct Snapshot {
     /// TUI apps hide the cursor and render their own; respecting this flag
     /// avoids a ghost cursor block drawn on top of the app's own cursor.
     pub cursor_visible: bool,
+    /// Whether the alternate screen (DECSET 47/1049) is active.
+    pub is_alt_screen: bool,
+    /// Whether bracketed paste mode (DECSET 2004) is enabled.
+    pub bracketed_paste: bool,
 }
 
 impl Snapshot {
@@ -185,6 +189,8 @@ impl Terminal {
                 title: v.title().map(str::to_owned),
                 closed,
                 cursor_visible: v.cursor_visible(),
+                is_alt_screen: v.on_alt_screen(),
+                bracketed_paste: v.bracketed_paste_enabled(),
             })
             .unwrap_or_else(|_| Snapshot {
                 screen: Vec::new(),
@@ -194,6 +200,8 @@ impl Terminal {
                 title: None,
                 closed,
                 cursor_visible: true,
+                is_alt_screen: false,
+                bracketed_paste: false,
             })
     }
 
