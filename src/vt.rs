@@ -76,6 +76,10 @@ pub struct Cell {
     pub width: u8,
     pub fg: Color,
     pub bg: Color,
+    /// Colour of the underline itself (SGR 58/59), independent of `fg`. Used
+    /// by LSP-style squiggly diagnostics in modern editors/terminals.
+    /// `Color::Default` means "same as `fg`".
+    pub underline_color: Color,
     pub attrs: Attrs,
 }
 
@@ -86,6 +90,7 @@ impl Cell {
             width: 1,
             fg: Color::Default,
             bg: Color::Default,
+            underline_color: Color::Default,
             attrs: Attrs::default(),
         }
     }
@@ -96,6 +101,7 @@ impl Cell {
             width: 0,
             fg: Color::Default,
             bg: Color::Default,
+            underline_color: Color::Default,
             attrs: Attrs::default(),
         }
     }
@@ -123,6 +129,7 @@ impl Default for Cell {
 struct Pen {
     fg: Color,
     bg: Color,
+    underline_color: Color,
     attrs: Attrs,
 }
 
@@ -131,6 +138,7 @@ impl Pen {
         Self {
             fg: Color::Default,
             bg: Color::Default,
+            underline_color: Color::Default,
             attrs: Attrs(0),
         }
     }
@@ -148,6 +156,7 @@ impl Pen {
             width: w,
             fg: self.fg,
             bg: self.bg,
+            underline_color: self.underline_color,
             attrs: self.attrs,
         }
     }
@@ -800,6 +809,13 @@ impl Vt {
                         i += used;
                     }
                 }
+                58 => {
+                    if let Some((c, used)) = parse_extended(&self.params[i + 1..]) {
+                        self.pen.underline_color = c;
+                        i += used;
+                    }
+                }
+                59 => self.pen.underline_color = Color::Default,
                 48 => {
                     if let Some((c, used)) = parse_extended(&self.params[i + 1..]) {
                         self.pen.bg = c;
@@ -1212,6 +1228,15 @@ mod tests {
         let cells = vt.render_cells();
         assert_eq!(cells[0][0].fg, Color::Rgb(10, 20, 30));
         assert_eq!(cells[0][1].fg, Color::Indexed(200));
+    }
+
+    #[test]
+    fn sgr_underline_color() {
+        let mut vt = Vt::new(20, 2);
+        vt.process("\u{1b}[4;58;2;255;0;0mX\u{1b}[59mY".as_bytes());
+        let cells = vt.render_cells();
+        assert_eq!(cells[0][0].underline_color, Color::Rgb(255, 0, 0));
+        assert_eq!(cells[0][1].underline_color, Color::Default);
     }
 
     #[test]
