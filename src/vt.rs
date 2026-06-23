@@ -232,6 +232,10 @@ enum State {
     Esc,
     Csi,
     Osc,
+    /// Saw `ESC` while in an OSC string: the terminator is `ESC \` (ST), so
+    /// the next byte decides whether to consume it (`\`) or treat `ESC` as
+    /// having aborted the OSC and start a fresh escape sequence.
+    OscEsc,
     /// Consume exactly one following byte (e.g. charset-select `ESC ( X`).
     SkipOne,
 }
@@ -411,11 +415,21 @@ impl Vt {
                         self.state = State::Ground;
                     }
                     '\u{1b}' => {
-                        // ESC starts ST (`ESC \`) — consume and terminate
+                        // Possible start of ST (`ESC \`); the next byte decides.
                         self.finish_osc();
-                        self.state = State::Ground;
+                        self.state = State::OscEsc;
                     }
                     _ => self.osc_buf.push(ch),
+                }
+            }
+            State::OscEsc => {
+                if ch == '\\' {
+                    // ST complete — both bytes consumed, nothing leaks to Ground.
+                    self.state = State::Ground;
+                } else {
+                    // Not ST: ESC aborted the OSC: start a fresh escape sequence.
+                    self.state = State::Ground;
+                    self.esc(ch);
                 }
             }
             State::SkipOne => self.state = State::Ground,
@@ -1402,6 +1416,25 @@ mod tests {
         let mut vt = Vt::new(20, 2);
         vt.process(b"\x1b]0;my title\x07");
         assert_eq!(vt.title(), Some("my title"));
+    }
+
+    #[test]
+    fn osc_st_terminator_consumes_both_bytes() {
+        let mut vt = Vt::new(20, 2);
+        // ST is ESC \ — neither byte should leak through as printable text.
+        vt.process(b"\x1b]0;title\x1b\\X");
+        assert_eq!(vt.title(), Some("title"));
+        assert_eq!(vt.render().lines().next(), Some("X"));
+    }
+
+    #[test]
+    fn osc_aborted_by_non_st_escape_starts_fresh_sequence() {
+        let mut vt = Vt::new(20, 2);
+        // ESC not followed by `\` aborts the OSC and begins a new sequence
+        // (here ESC M = reverse index) instead of leaking either byte.
+        vt.process(b"\x1b]0;title\x1bMX");
+        assert_eq!(vt.title(), Some("title"));
+        assert_eq!(vt.render().lines().next(), Some("X"));
     }
 
     #[test]
