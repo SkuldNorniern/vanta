@@ -14,11 +14,5 @@ expect_used = "warn"
 
 [features]
 default = ["inhouse"]
-# Direct ConPTY (Windows) / forkpty (Unix) FFI — the target backend.
+# Direct ConPTY (Windows) / forkpty (Unix) FFI — the only backend.
 inhouse = []
-# Temporary reference backend via the `portable-pty` crate, kept only until
-# `inhouse` is proven on every platform. Not a shipped fallback.
-portable = ["portable-pty"]
-
-[dependencies]
-portable-pty = { version = "0.8", optional = true }

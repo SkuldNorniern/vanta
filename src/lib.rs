@@ -5,9 +5,8 @@
 //! [`vt::Vt`] grid that interprets cursor/erase escapes — so layout is correct
 //! instead of mangled by naive escape stripping.
 //!
-//! The PTY backend is swappable behind [`pty::Pty`]:
-//! - `portable` (default): the `portable-pty` crate.
-//! - `inhouse`: direct ConPTY / forkpty FFI (scaffold — see `pty::inhouse`).
+//! The PTY backend lives behind [`pty::Pty`]: [`pty::inhouse`] is direct
+//! ConPTY (Windows) / forkpty (Unix) FFI, with no external dependencies.
 
 pub mod pty;
 pub mod vt;

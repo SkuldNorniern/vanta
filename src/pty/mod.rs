@@ -1,15 +1,11 @@
 //! PTY backend abstraction.
 //!
 //! [`Pty`] is the seam between [`crate::Terminal`] and a concrete pseudo-terminal
-//! implementation. Two backends live behind it:
-//! - [`portable_backend`] — the `portable-pty` crate (default).
-//! - [`inhouse`] — direct ConPTY/forkpty FFI (scaffold; enable with `inhouse`).
+//! implementation: [`inhouse`], direct ConPTY (Windows) / forkpty (Unix) FFI.
 
 use std::io::{self, Read};
 
 pub mod inhouse;
-#[cfg(feature = "portable")]
-pub mod portable_backend;
 
 /// The child process's exit status, as reported by the backend.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -42,21 +38,15 @@ pub trait Pty: Send {
 }
 
 /// Spawn the default shell on a PTY using the compiled-in backend.
-// Returns are required to keep the cfg-gated branches mutually exclusive.
-#[allow(clippy::needless_return)]
 pub fn spawn_default() -> io::Result<Box<dyn Pty>> {
     #[cfg(feature = "inhouse")]
     {
-        return inhouse::spawn();
+        inhouse::spawn()
     }
-    #[cfg(all(feature = "portable", not(feature = "inhouse")))]
-    {
-        return portable_backend::spawn();
-    }
-    #[cfg(not(any(feature = "portable", feature = "inhouse")))]
+    #[cfg(not(feature = "inhouse"))]
     {
         Err(io::Error::other(
-            "no PTY backend enabled (enable `portable` or `inhouse`)",
+            "no PTY backend enabled (enable `inhouse`)",
         ))
     }
 }
