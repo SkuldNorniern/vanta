@@ -10,9 +10,3 @@ todo = "deny"
 unimplemented = "deny"
 unwrap_used = "warn"
 expect_used = "warn"
-
-
-[features]
-default = ["inhouse"]
-# Direct ConPTY (Windows) / forkpty (Unix) FFI — the only backend.
-inhouse = []

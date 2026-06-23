@@ -1,4 +1,4 @@
-//! Windows in-house PTY backend — direct ConPTY FFI, no `windows-sys` dependency.
+//! Windows PTY backend — direct ConPTY FFI, no `windows-sys` dependency.
 //!
 //! Spawn sequence: create an input pipe and an output pipe, hand their console
 //! ends to `CreatePseudoConsole`, close those ends in this process, attach the
@@ -6,7 +6,7 @@
 //! then `CreateProcessW`. The host keeps the input pipe's write end and the
 //! output pipe's read end.
 
-use super::super::{ExitStatus, Pty, SpawnConfig};
+use super::{ExitStatus, Pty, SpawnConfig};
 use std::collections::BTreeMap;
 use std::env;
 use std::ffi::{OsStr, OsString, c_void};

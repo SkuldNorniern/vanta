@@ -1,12 +1,15 @@
 //! PTY backend abstraction.
 //!
-//! [`Pty`] is the seam between [`crate::Terminal`] and a concrete pseudo-terminal
-//! implementation: [`inhouse`], direct ConPTY (Windows) / forkpty (Unix) FFI.
+//! [`Pty`] is the seam between [`crate::Terminal`] and the platform PTY: direct
+//! ConPTY FFI on Windows ([`windows`]), forkpty FFI on Unix ([`unix`]).
 
 use std::io::{self, Read};
 use std::path::PathBuf;
 
-pub mod inhouse;
+#[cfg(unix)]
+mod unix;
+#[cfg(windows)]
+mod windows;
 
 /// The child process's exit status, as reported by the backend.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -74,22 +77,24 @@ impl Default for SpawnConfig {
     }
 }
 
-/// Spawn `config` on a PTY using the compiled-in backend.
+/// Spawn `config` on a PTY using the platform backend.
 pub fn spawn(config: &SpawnConfig) -> io::Result<Box<dyn Pty>> {
-    #[cfg(feature = "inhouse")]
+    #[cfg(windows)]
     {
-        inhouse::spawn(config)
+        windows::spawn(config)
     }
-    #[cfg(not(feature = "inhouse"))]
+    #[cfg(unix)]
+    {
+        unix::spawn(config)
+    }
+    #[cfg(not(any(windows, unix)))]
     {
         let _ = config;
-        Err(io::Error::other(
-            "no PTY backend enabled (enable `inhouse`)",
-        ))
+        Err(io::Error::other("no PTY backend for this platform"))
     }
 }
 
-/// Spawn the platform default shell on a PTY using the compiled-in backend.
+/// Spawn the platform default shell on a PTY at the default size.
 pub fn spawn_default() -> io::Result<Box<dyn Pty>> {
     spawn(&SpawnConfig::default())
 }

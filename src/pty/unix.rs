@@ -1,4 +1,4 @@
-//! Unix in-house PTY backend — `openpty`/`fork`/`ioctl`/`execve` FFI, no `libc`
+//! Unix PTY backend — `openpty`/`fork`/`ioctl`/`execve` FFI, no `libc`
 //! dependency. One code path serves Linux, macOS, and the BSDs; only the
 //! `ioctl` constants and `openpty`'s link target differ per OS (see [`consts`]).
 //!
@@ -9,7 +9,7 @@
 //! `execve`. The parent keeps the master fd (duplicated once more so the
 //! reader and the writer/resize/kill side each own an independent fd).
 
-use super::super::{ExitStatus, Pty, SpawnConfig};
+use super::{ExitStatus, Pty, SpawnConfig};
 use std::collections::BTreeMap;
 use std::env;
 use std::ffi::{CString, OsString};
