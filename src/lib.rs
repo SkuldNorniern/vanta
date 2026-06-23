@@ -36,6 +36,10 @@ pub struct Snapshot {
     pub title: Option<String>,
     /// Whether the PTY output stream has reached EOF (same as [`Terminal::is_closed`]).
     pub closed: bool,
+    /// Whether the cursor should be shown (DECTCEM, `\x1b[?25h`/`\x1b[?25l`).
+    /// TUI apps hide the cursor and render their own; respecting this flag
+    /// avoids a ghost cursor block drawn on top of the app's own cursor.
+    pub cursor_visible: bool,
 }
 
 impl Snapshot {
@@ -180,6 +184,7 @@ impl Terminal {
                 version: self.version.load(Ordering::Acquire),
                 title: v.title().map(str::to_owned),
                 closed,
+                cursor_visible: v.cursor_visible(),
             })
             .unwrap_or_else(|_| Snapshot {
                 screen: Vec::new(),
@@ -188,6 +193,7 @@ impl Terminal {
                 version: self.version.load(Ordering::Acquire),
                 title: None,
                 closed,
+                cursor_visible: true,
             })
     }
 

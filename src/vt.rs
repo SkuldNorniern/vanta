@@ -957,6 +957,14 @@ impl Vt {
             col -= 1;
         }
         self.merge_into_cluster(self.cy, col, ch);
+        // VS16 (U+FE0F) forces emoji presentation on the preceding character.
+        // Widen the base cell from 1 → 2 and insert a continuation cell so the
+        // glyph occupies the correct two columns (e.g. `1️⃣` = '1' + VS16 + U+20E3).
+        if ch == '\u{FE0F}' && self.screen[self.cy][col].width == 1 && col + 1 < self.cols {
+            self.screen[self.cy][col].width = 2;
+            self.screen[self.cy][col + 1] = Cell::continuation();
+            self.cx = col + 2;
+        }
         self.pending_zwj = if ch == '\u{200d}' {
             Some((self.cy, col))
         } else {
@@ -1580,5 +1588,30 @@ mod tests {
             vt.process(&[0x80]);
         }
         assert!(vt.pending_utf8.len() <= 4);
+    }
+
+    #[test]
+    fn keycap_sequence_renders_width_two() {
+        // `1️⃣` = U+0031 DIGIT ONE + U+FE0F VS16 + U+20E3 COMBINING ENCLOSING KEYCAP
+        // VS16 forces emoji presentation → the whole cluster must occupy 2 columns.
+        let mut vt = Vt::new(20, 2);
+        vt.process("1\u{FE0F}\u{20E3}".as_bytes());
+        let cells = vt.render_cells();
+        assert_eq!(cells[0][0].width, 2, "keycap should be 2 columns wide");
+        assert!(
+            is_continuation(&cells[0][1]),
+            "col 1 should be continuation"
+        );
+        assert_eq!(cluster_text(&cells[0][0]), "1\u{FE0F}\u{20E3}");
+    }
+
+    #[test]
+    fn keycap_followed_by_char_places_correctly() {
+        // After the 2-column keycap, the next character should land at col 2.
+        let mut vt = Vt::new(20, 2);
+        vt.process("1\u{FE0F}\u{20E3}X".as_bytes());
+        let cells = vt.render_cells();
+        assert_eq!(cells[0][0].width, 2);
+        assert_eq!(cells[0][2].ch(), 'X');
     }
 }
