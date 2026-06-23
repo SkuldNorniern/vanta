@@ -24,3 +24,6 @@ target
 # Added by cargo
 
 /target
+
+# Vanta is a library — don't commit the lock file
+/Cargo.lock
