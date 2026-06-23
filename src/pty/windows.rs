@@ -12,10 +12,10 @@ use std::env;
 use std::ffi::{OsStr, OsString, c_void};
 use std::io;
 use std::iter::repeat_n;
-use std::mem::zeroed;
+use std::mem::{transmute, zeroed};
 use std::os::windows::ffi::OsStrExt;
 use std::ptr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
 type Handle = *mut c_void;
@@ -147,19 +147,62 @@ unsafe extern "system" {
         inherit_handle: i32,
         options: u32,
     ) -> i32;
-    fn CreatePseudoConsole(
-        size: Coord,
-        input: Handle,
-        output: Handle,
-        flags: u32,
-        pseudo_console: *mut Handle,
-    ) -> i32;
-    fn ResizePseudoConsole(pseudo_console: Handle, size: Coord) -> i32;
-    fn ClosePseudoConsole(pseudo_console: Handle);
+    fn GetModuleHandleW(module_name: *const u16) -> Handle;
+    fn GetProcAddress(h_module: Handle, lp_proc_name: *const u8) -> *mut c_void;
 }
 
 fn last_error() -> io::Error {
     io::Error::from_raw_os_error(unsafe { GetLastError() } as i32)
+}
+
+type FnCreatePseudoConsole =
+    unsafe extern "system" fn(Coord, Handle, Handle, u32, *mut Handle) -> i32;
+type FnResizePseudoConsole = unsafe extern "system" fn(Handle, Coord) -> i32;
+type FnClosePseudoConsole = unsafe extern "system" fn(Handle);
+
+struct ConPtyFns {
+    create: FnCreatePseudoConsole,
+    resize: FnResizePseudoConsole,
+    close: FnClosePseudoConsole,
+}
+
+// Function pointers from a stable, always-loaded system DLL are Send+Sync.
+unsafe impl Send for ConPtyFns {}
+unsafe impl Sync for ConPtyFns {}
+
+static CONPTY: OnceLock<Option<ConPtyFns>> = OnceLock::new();
+
+fn get_conpty() -> io::Result<&'static ConPtyFns> {
+    CONPTY
+        .get_or_init(|| unsafe { try_load_conpty() })
+        .as_ref()
+        .ok_or_else(|| {
+            io::Error::other(
+                "ConPTY (CreatePseudoConsole) is not available; \
+                 requires Windows 10 version 1809 (build 17763) or later",
+            )
+        })
+}
+
+unsafe fn try_load_conpty() -> Option<ConPtyFns> {
+    let name: Vec<u16> = "kernel32.dll\0".encode_utf16().collect();
+    // GetModuleHandleW does not increment the refcount — safe for kernel32,
+    // which is pinned for the process lifetime and always already loaded.
+    let hmod = GetModuleHandleW(name.as_ptr());
+    if hmod.is_null() {
+        return None;
+    }
+    let create_ptr = GetProcAddress(hmod, b"CreatePseudoConsole\0".as_ptr());
+    let resize_ptr = GetProcAddress(hmod, b"ResizePseudoConsole\0".as_ptr());
+    let close_ptr = GetProcAddress(hmod, b"ClosePseudoConsole\0".as_ptr());
+    if create_ptr.is_null() || resize_ptr.is_null() || close_ptr.is_null() {
+        return None;
+    }
+    Some(ConPtyFns {
+        create: transmute(create_ptr),
+        resize: transmute(resize_ptr),
+        close: transmute(close_ptr),
+    })
 }
 
 /// Closes with `CloseHandle`. `None` for null/invalid handles.
@@ -186,13 +229,20 @@ impl Drop for OwnedHandle {
 unsafe impl Send for OwnedHandle {}
 
 /// Closes with `ClosePseudoConsole`, which also signals the child.
-struct PseudoConsole(Handle);
+struct PseudoConsole {
+    handle: Handle,
+    close_fn: FnClosePseudoConsole,
+}
+
+impl PseudoConsole {
+    fn new(handle: Handle, close_fn: FnClosePseudoConsole) -> Self {
+        Self { handle, close_fn }
+    }
+}
 
 impl Drop for PseudoConsole {
     fn drop(&mut self) {
-        unsafe {
-            ClosePseudoConsole(self.0);
-        }
+        unsafe { (self.close_fn)(self.handle) };
     }
 }
 
@@ -311,12 +361,14 @@ fn wide_nul(s: &OsStr) -> Vec<u16> {
 }
 
 pub(super) fn spawn(config: &SpawnConfig) -> io::Result<Box<dyn Pty>> {
+    let fns = get_conpty()?;
+
     let (input_read, input_write) = create_pipe()?;
     let (output_read, output_write) = create_pipe()?;
 
     let mut hpc: Handle = ptr::null_mut();
     let hr = unsafe {
-        CreatePseudoConsole(
+        (fns.create)(
             Coord {
                 x: config.cols as i16,
                 y: config.rows as i16,
@@ -330,7 +382,7 @@ pub(super) fn spawn(config: &SpawnConfig) -> io::Result<Box<dyn Pty>> {
     if hr != 0 {
         return Err(io::Error::from_raw_os_error(hr));
     }
-    let pc = PseudoConsole(hpc);
+    let pc = PseudoConsole::new(hpc, fns.close);
     // ConPTY now owns these ends; the host keeps input_write/output_read.
     drop(input_read);
     drop(output_write);
@@ -508,6 +560,7 @@ impl Pty for InHousePty {
     }
 
     fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
+        let fns = get_conpty()?;
         let guard = self
             .pc
             .lock()
@@ -516,8 +569,8 @@ impl Pty for InHousePty {
             .as_ref()
             .ok_or_else(|| io::Error::other("pty pseudo console already closed"))?;
         let hr = unsafe {
-            ResizePseudoConsole(
-                pc.0,
+            (fns.resize)(
+                pc.handle,
                 Coord {
                     x: cols as i16,
                     y: rows as i16,
