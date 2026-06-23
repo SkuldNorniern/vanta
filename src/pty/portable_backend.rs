@@ -1,6 +1,6 @@
 //! Cross-platform PTY backend via the `portable-pty` crate (ConPTY / forkpty).
 
-use super::Pty;
+use super::{ExitStatus, Pty};
 use std::io::{self, Read, Write};
 use std::sync::Mutex;
 
@@ -40,7 +40,7 @@ pub fn spawn() -> io::Result<Box<dyn Pty>> {
 
     Ok(Box::new(PortablePty {
         master: Mutex::new(pair.master),
-        writer: Mutex::new(writer),
+        writer: Mutex::new(Some(writer)),
         reader: Mutex::new(Some(reader)),
         child: Mutex::new(child),
     }))
@@ -48,7 +48,7 @@ pub fn spawn() -> io::Result<Box<dyn Pty>> {
 
 struct PortablePty {
     master: Mutex<Box<dyn MasterPty + Send>>,
-    writer: Mutex<Box<dyn Write + Send>>,
+    writer: Mutex<Option<Box<dyn Write + Send>>>,
     reader: Mutex<Option<Box<dyn Read + Send>>>,
     child: Mutex<Box<dyn Child + Send + Sync>>,
 }
@@ -63,19 +63,28 @@ impl Pty for PortablePty {
             .writer
             .lock()
             .map_err(|_| io::Error::other("pty writer poisoned"))?;
-        w.write_all(data)?;
-        w.flush()
+        match w.as_mut() {
+            Some(w) => {
+                w.write_all(data)?;
+                w.flush()
+            }
+            None => Err(io::Error::other("pty input already closed")),
+        }
     }
 
-    fn resize(&self, cols: u16, rows: u16) {
-        if let Ok(master) = self.master.lock() {
-            let _ = master.resize(PtySize {
+    fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
+        let master = self
+            .master
+            .lock()
+            .map_err(|_| io::Error::other("pty master poisoned"))?;
+        master
+            .resize(PtySize {
                 rows,
                 cols,
                 pixel_width: 0,
                 pixel_height: 0,
-            });
-        }
+            })
+            .map_err(oerr)
     }
 
     fn is_running(&self) -> bool {
@@ -83,6 +92,37 @@ impl Pty for PortablePty {
             .lock()
             .map(|mut c| matches!(c.try_wait(), Ok(None)))
             .unwrap_or(false)
+    }
+
+    fn try_wait(&self) -> io::Result<Option<ExitStatus>> {
+        let mut c = self
+            .child
+            .lock()
+            .map_err(|_| io::Error::other("pty child poisoned"))?;
+        Ok(c.try_wait().map_err(oerr)?.map(|status| {
+            if status.success() {
+                ExitStatus::Code(0)
+            } else {
+                ExitStatus::Code(status.exit_code() as i32)
+            }
+        }))
+    }
+
+    fn kill(&self) -> io::Result<()> {
+        let mut c = self
+            .child
+            .lock()
+            .map_err(|_| io::Error::other("pty child poisoned"))?;
+        c.kill().map_err(oerr)
+    }
+
+    fn close_input(&self) -> io::Result<()> {
+        let mut w = self
+            .writer
+            .lock()
+            .map_err(|_| io::Error::other("pty writer poisoned"))?;
+        *w = None;
+        Ok(())
     }
 }
 

@@ -40,7 +40,7 @@ impl Terminal {
         let reader = pty
             .take_reader()
             .ok_or_else(|| std::io::Error::other("pty produced no reader"))?;
-        pty.resize(INIT_COLS, INIT_ROWS);
+        pty.resize(INIT_COLS, INIT_ROWS)?;
 
         let vt = Arc::new(Mutex::new(Vt::new(INIT_COLS as usize, INIT_ROWS as usize)));
         let version = Arc::new(AtomicU64::new(0));
@@ -60,15 +60,16 @@ impl Terminal {
     }
 
     /// Resize the PTY and the VT grid to `cols` x `rows` character cells.
-    pub fn resize(&self, cols: u16, rows: u16) {
+    pub fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
         let cols = cols.max(1);
         let rows = rows.max(1);
         if let Ok(mut v) = self.vt.lock() {
             v.resize(cols as usize, rows as usize);
         }
-        self.pty.resize(cols, rows);
+        let result = self.pty.resize(cols, rows);
         // Force the next snapshot: the grid reflowed even if no new bytes arrived.
         self.version.fetch_add(1, Ordering::Release);
+        result
     }
 
     /// The current screen (scrollback + grid) rendered as text.
@@ -89,6 +90,22 @@ impl Terminal {
     /// Whether the shell process is still running.
     pub fn is_running(&self) -> bool {
         self.pty.is_running()
+    }
+
+    /// Non-blocking check for the shell's exit status; `Ok(None)` means it is
+    /// still running.
+    pub fn try_wait(&self) -> std::io::Result<Option<pty::ExitStatus>> {
+        self.pty.try_wait()
+    }
+
+    /// Forcibly terminate the shell process.
+    pub fn kill(&self) -> std::io::Result<()> {
+        self.pty.kill()
+    }
+
+    /// Close the PTY input (signals EOF on the shell's stdin).
+    pub fn close_input(&self) -> std::io::Result<()> {
+        self.pty.close_input()
     }
 }
 
