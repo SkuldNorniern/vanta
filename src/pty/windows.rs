@@ -15,7 +15,8 @@ use std::iter::repeat_n;
 use std::mem::zeroed;
 use std::os::windows::ffi::OsStrExt;
 use std::ptr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 type Handle = *mut c_void;
 
@@ -26,6 +27,8 @@ const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
 const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: usize = 0x0002_0016;
 const WAIT_OBJECT_0: u32 = 0;
 const WAIT_TIMEOUT: u32 = 258;
+const INFINITE: u32 = 0xFFFF_FFFF;
+const DUPLICATE_SAME_ACCESS: u32 = 0x0000_0002;
 const ERROR_BROKEN_PIPE: i32 = 109;
 const ERROR_HANDLE_EOF: i32 = 38;
 const ERROR_NO_DATA: i32 = 232;
@@ -134,6 +137,16 @@ unsafe extern "system" {
     ) -> i32;
     fn DeleteProcThreadAttributeList(list: *mut c_void);
     fn GetLastError() -> u32;
+    fn GetCurrentProcess() -> Handle;
+    fn DuplicateHandle(
+        source_process: Handle,
+        source_handle: Handle,
+        target_process: Handle,
+        target_handle: *mut Handle,
+        desired_access: u32,
+        inherit_handle: i32,
+        options: u32,
+    ) -> i32;
     fn CreatePseudoConsole(
         size: Coord,
         input: Handle,
@@ -406,6 +419,43 @@ pub(super) fn spawn(config: &SpawnConfig) -> io::Result<Box<dyn Pty>> {
     let process = OwnedHandle::new(pi.h_process)
         .ok_or_else(|| io::Error::other("CreateProcessW returned an invalid process handle"))?;
 
+    // ConPTY does not close the output pipe just because the launched process
+    // exited — only `ClosePseudoConsole` does that, and conhost otherwise
+    // keeps the pseudoconsole session (and its pipes) open indefinitely. A
+    // background thread waits for the process to exit and closes the pseudo
+    // console proactively, so EOF (and `Terminal::is_closed`) becomes
+    // observable shortly after exit instead of only when the whole `Pty` is
+    // dropped.
+    let pc = Arc::new(Mutex::new(Some(pc)));
+    let mut watch_handle: Handle = ptr::null_mut();
+    let duped = unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            process.0,
+            GetCurrentProcess(),
+            &mut watch_handle,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    };
+    if duped != 0 {
+        if let Some(watch_handle) = OwnedHandle::new(watch_handle) {
+            let pc_watch = pc.clone();
+            thread::spawn(move || {
+                unsafe {
+                    WaitForSingleObject(watch_handle.0, INFINITE);
+                }
+                drop(watch_handle);
+                if let Ok(mut guard) = pc_watch.lock() {
+                    *guard = None; // drops PseudoConsole -> ClosePseudoConsole
+                }
+            });
+        }
+    }
+    // If duplication failed, the early-close optimization is skipped; the
+    // pseudo console still closes once the `Pty` itself is dropped.
+
     Ok(Box::new(InHousePty {
         output_read: Mutex::new(Some(output_read)),
         input_write: Mutex::new(Some(input_write)),
@@ -419,7 +469,9 @@ struct InHousePty {
     output_read: Mutex<Option<OwnedHandle>>,
     input_write: Mutex<Option<OwnedHandle>>,
     process: OwnedHandle,
-    pc: PseudoConsole,
+    /// `None` once closed — either explicitly or by the watcher thread
+    /// spawned in [`spawn`] as soon as the child process exits.
+    pc: Arc<Mutex<Option<PseudoConsole>>>,
     exit_status: Mutex<Option<ExitStatus>>,
 }
 
@@ -456,9 +508,16 @@ impl Pty for InHousePty {
     }
 
     fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
+        let guard = self
+            .pc
+            .lock()
+            .map_err(|_| io::Error::other("pty pseudo console poisoned"))?;
+        let pc = guard
+            .as_ref()
+            .ok_or_else(|| io::Error::other("pty pseudo console already closed"))?;
         let hr = unsafe {
             ResizePseudoConsole(
-                self.pc.0,
+                pc.0,
                 Coord {
                     x: cols as i16,
                     y: rows as i16,
