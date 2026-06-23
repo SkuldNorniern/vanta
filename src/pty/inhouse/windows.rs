@@ -330,7 +330,12 @@ pub(super) fn spawn() -> io::Result<Box<dyn Pty>> {
     }
     let mut attr_buf = vec![0u8; attr_size];
     let ok = unsafe {
-        InitializeProcThreadAttributeList(attr_buf.as_mut_ptr() as *mut c_void, 1, 0, &mut attr_size)
+        InitializeProcThreadAttributeList(
+            attr_buf.as_mut_ptr() as *mut c_void,
+            1,
+            0,
+            &mut attr_size,
+        )
     };
     if ok == 0 {
         return Err(last_error());
@@ -429,9 +434,8 @@ impl Pty for InHousePty {
             let chunk = &data[offset..];
             let len = chunk.len().min(u32::MAX as usize) as u32;
             let mut written = 0u32;
-            let ok = unsafe {
-                WriteFile(handle.0, chunk.as_ptr(), len, &mut written, ptr::null_mut())
-            };
+            let ok =
+                unsafe { WriteFile(handle.0, chunk.as_ptr(), len, &mut written, ptr::null_mut()) };
             if ok == 0 {
                 return Err(last_error());
             }
@@ -545,7 +549,10 @@ mod tests {
 
     #[test]
     fn doubles_trailing_backslashes_when_quoted() {
-        assert_eq!(quote_arg(r"C:\path with space\"), "\"C:\\path with space\\\\\"");
+        assert_eq!(
+            quote_arg(r"C:\path with space\"),
+            "\"C:\\path with space\\\\\""
+        );
     }
 
     #[test]

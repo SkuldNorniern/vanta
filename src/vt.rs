@@ -11,6 +11,9 @@
 //! The screen scrolls into a capped scrollback; [`Vt::render`] returns the text,
 //! while [`Vt::render_cells`] returns the coloured grid for the GUI.
 
+use std::mem;
+use std::str;
+
 const MAX_SCROLLBACK: usize = 5000;
 const TAB: usize = 8;
 
@@ -106,6 +109,9 @@ pub struct Vt {
     state: State,
     params: Vec<u32>,
     cur_param: Option<u32>,
+    /// Trailing bytes of an as-yet-incomplete UTF-8 sequence, held over to the
+    /// next `process` call (a multi-byte scalar can be split across reads).
+    pending_utf8: Vec<u8>,
 }
 
 impl Vt {
@@ -123,26 +129,71 @@ impl Vt {
             state: State::Ground,
             params: Vec::new(),
             cur_param: None,
+            pending_utf8: Vec::new(),
         }
     }
 
-    /// Feed a chunk of shell output through the emulator.
-    pub fn process(&mut self, text: &str) {
-        for ch in text.chars() {
-            match self.state {
-                State::Ground => self.ground(ch),
-                State::Esc => self.esc(ch),
-                State::Csi => self.csi(ch),
-                State::Osc => {
-                    // Consume until BEL or ST (ESC \). Approximate: end on BEL or ESC.
-                    if ch == '\u{7}' {
-                        self.state = State::Ground;
-                    } else if ch == '\u{1b}' {
-                        self.state = State::Ground; // swallow the following '\' next round if any
+    /// Feed a chunk of raw shell output bytes through the emulator. Owns UTF-8
+    /// decoding (incremental, so a scalar split across two reads is handled)
+    /// as well as escape parsing.
+    pub fn process(&mut self, bytes: &[u8]) {
+        if self.pending_utf8.is_empty() {
+            self.process_decoded(bytes);
+        } else {
+            let mut combined = mem::take(&mut self.pending_utf8);
+            combined.extend_from_slice(bytes);
+            self.process_decoded(&combined);
+        }
+    }
+
+    /// Decode `buf` as UTF-8, feeding complete scalars to [`Self::feed_char`].
+    /// Invalid byte sequences yield one U+FFFD per maximal invalid subpart;
+    /// an incomplete trailing sequence is stashed in `pending_utf8`.
+    fn process_decoded(&mut self, mut buf: &[u8]) {
+        loop {
+            match str::from_utf8(buf) {
+                Ok(s) => {
+                    for ch in s.chars() {
+                        self.feed_char(ch);
+                    }
+                    return;
+                }
+                Err(e) => {
+                    let valid_up_to = e.valid_up_to();
+                    if let Ok(s) = str::from_utf8(&buf[..valid_up_to]) {
+                        for ch in s.chars() {
+                            self.feed_char(ch);
+                        }
+                    }
+                    match e.error_len() {
+                        None => {
+                            self.pending_utf8 = buf[valid_up_to..].to_vec();
+                            return;
+                        }
+                        Some(len) => {
+                            self.feed_char('\u{fffd}');
+                            buf = &buf[valid_up_to + len..];
+                        }
                     }
                 }
-                State::SkipOne => self.state = State::Ground,
             }
+        }
+    }
+
+    fn feed_char(&mut self, ch: char) {
+        match self.state {
+            State::Ground => self.ground(ch),
+            State::Esc => self.esc(ch),
+            State::Csi => self.csi(ch),
+            State::Osc => {
+                // Consume until BEL or ST (ESC \). Approximate: end on BEL or ESC.
+                if ch == '\u{7}' {
+                    self.state = State::Ground;
+                } else if ch == '\u{1b}' {
+                    self.state = State::Ground; // swallow the following '\' next round if any
+                }
+            }
+            State::SkipOne => self.state = State::Ground,
         }
     }
 
@@ -467,7 +518,7 @@ mod tests {
 
     fn render(input: &str) -> String {
         let mut vt = Vt::new(20, 5);
-        vt.process(input);
+        vt.process(input.as_bytes());
         vt.render()
     }
 
@@ -514,7 +565,7 @@ mod tests {
     #[test]
     fn sgr_sets_cell_colors() {
         let mut vt = Vt::new(20, 2);
-        vt.process("\u{1b}[31mR\u{1b}[0mn");
+        vt.process("\u{1b}[31mR\u{1b}[0mn".as_bytes());
         let cells = vt.render_cells();
         assert_eq!(cells[0][0].ch, 'R');
         assert_eq!(cells[0][0].fg, Color::Indexed(1)); // red
@@ -525,7 +576,7 @@ mod tests {
     #[test]
     fn sgr_truecolor_and_256() {
         let mut vt = Vt::new(20, 2);
-        vt.process("\u{1b}[38;2;10;20;30mX\u{1b}[38;5;200mY");
+        vt.process("\u{1b}[38;2;10;20;30mX\u{1b}[38;5;200mY".as_bytes());
         let cells = vt.render_cells();
         assert_eq!(cells[0][0].fg, Color::Rgb(10, 20, 30));
         assert_eq!(cells[0][1].fg, Color::Indexed(200));
@@ -534,7 +585,7 @@ mod tests {
     #[test]
     fn sgr_bright_and_bg() {
         let mut vt = Vt::new(20, 2);
-        vt.process("\u{1b}[92;44mX");
+        vt.process("\u{1b}[92;44mX".as_bytes());
         let cells = vt.render_cells();
         assert_eq!(cells[0][0].fg, Color::Indexed(10)); // bright green = 2 + 8
         assert_eq!(cells[0][0].bg, Color::Indexed(4)); // blue
@@ -543,9 +594,82 @@ mod tests {
     #[test]
     fn scrolls_into_scrollback() {
         let mut vt = Vt::new(4, 2);
-        vt.process("a\r\nb\r\nc"); // 3 lines into a 2-row screen
+        vt.process("a\r\nb\r\nc".as_bytes()); // 3 lines into a 2-row screen
         let out = vt.render();
         assert!(out.starts_with("a\n"));
         assert!(out.contains('c'));
+    }
+
+    #[test]
+    fn korean_syllable_split_across_chunks() {
+        // U+D55C "한" = 0xED 0x95 0x9C
+        let mut vt = Vt::new(20, 2);
+        vt.process(&[0xED, 0x95]);
+        vt.process(&[0x9C]);
+        assert_eq!(vt.render_cells()[0][0].ch, '\u{d55c}');
+    }
+
+    #[test]
+    fn emoji_split_2_2() {
+        // U+1F600 "😀" = 0xF0 0x9F 0x98 0x80, split 2+2
+        let mut vt = Vt::new(20, 2);
+        vt.process(&[0xF0, 0x9F]);
+        vt.process(&[0x98, 0x80]);
+        assert_eq!(vt.render_cells()[0][0].ch, '\u{1f600}');
+    }
+
+    #[test]
+    fn emoji_split_3_1() {
+        let mut vt = Vt::new(20, 2);
+        vt.process(&[0xF0, 0x9F, 0x98]);
+        vt.process(&[0x80]);
+        assert_eq!(vt.render_cells()[0][0].ch, '\u{1f600}');
+    }
+
+    #[test]
+    fn emoji_split_1_3() {
+        let mut vt = Vt::new(20, 2);
+        vt.process(&[0xF0]);
+        vt.process(&[0x9F, 0x98, 0x80]);
+        assert_eq!(vt.render_cells()[0][0].ch, '\u{1f600}');
+    }
+
+    #[test]
+    fn escape_sequence_split_across_chunks() {
+        let mut vt = Vt::new(20, 2);
+        vt.process(b"\x1b[");
+        vt.process(b"31m");
+        vt.process(b"X");
+        assert_eq!(vt.render_cells()[0][0].fg, Color::Indexed(1));
+    }
+
+    #[test]
+    fn osc_title_split_across_chunks() {
+        // OSC sequences are consumed, not displayed; this must not corrupt
+        // ground-state text written immediately after.
+        let mut vt = Vt::new(20, 2);
+        vt.process(b"\x1b]0;ti");
+        vt.process(b"tle\x07X");
+        assert_eq!(vt.render_cells()[0][0].ch, 'X');
+    }
+
+    #[test]
+    fn invalid_byte_sequence_recovers() {
+        // Lone continuation byte, then an overlong/truncated lead byte, then
+        // valid ASCII: must not corrupt parser state and must not panic.
+        let mut vt = Vt::new(20, 2);
+        vt.process(&[0x80, 0xC0, b'A']);
+        assert_eq!(vt.render_cells()[0][2].ch, 'A');
+    }
+
+    #[test]
+    fn pending_buffer_does_not_grow_unbounded() {
+        // A stream of lone continuation bytes are all invalid on their own;
+        // each must be consumed (replaced) rather than accumulating forever.
+        let mut vt = Vt::new(20, 2);
+        for _ in 0..64 {
+            vt.process(&[0x80]);
+        }
+        assert!(vt.pending_utf8.len() <= 4);
     }
 }

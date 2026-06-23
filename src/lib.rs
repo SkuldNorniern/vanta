@@ -120,9 +120,8 @@ fn spawn_reader<R: Read + Send + 'static>(
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    let text = String::from_utf8_lossy(&buf[..n]);
                     if let Ok(mut v) = vt.lock() {
-                        v.process(&text);
+                        v.process(&buf[..n]);
                     }
                     version.fetch_add(1, Ordering::Release);
                 }
