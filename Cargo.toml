@@ -3,6 +3,15 @@ name = "vanta"
 version = "0.1.0"
 edition = "2024"
 
+[lints.clippy]
+absolute_paths = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "warn"
+expect_used = "warn"
+
+
 [features]
 default = ["inhouse"]
 # Direct ConPTY (Windows) / forkpty (Unix) FFI — the target backend.
