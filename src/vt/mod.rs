@@ -125,6 +125,8 @@ pub struct Vt {
     cur_param: Option<u32>,
     /// Set when CSI was introduced with `?` (DEC private mode sequences).
     csi_private: bool,
+    /// Set when CSI was introduced with `>` (secondary device attributes).
+    csi_greater: bool,
     /// Set when CSI includes a space intermediate byte (e.g. DECSCUSR).
     csi_intermediate_space: bool,
     /// Trailing bytes of an as-yet-incomplete UTF-8 sequence, held over to the
@@ -209,6 +211,7 @@ impl Vt {
             params: Vec::new(),
             cur_param: None,
             csi_private: false,
+            csi_greater: false,
             csi_intermediate_space: false,
             pending_utf8: Vec::new(),
             pending_zwj: None,
@@ -342,7 +345,11 @@ impl Vt {
                             return;
                         }
                         Some(len) => {
-                            self.feed_char('\u{fffd}');
+                            if len == 1 && self.feed_c1_control(buf[valid_up_to]) {
+                                // handled as an 8-bit C1 control
+                            } else {
+                                self.feed_char('\u{fffd}');
+                            }
                             buf = &buf[valid_up_to + len..];
                         }
                     }
@@ -352,6 +359,9 @@ impl Vt {
     }
 
     fn feed_char(&mut self, ch: char) {
+        if matches!(ch as u32, 0x80..=0x9F) && self.feed_c1_control(ch as u8) {
+            return;
+        }
         match self.state {
             State::Ground => self.ground(ch),
             State::Esc => self.esc(ch),
@@ -377,6 +387,48 @@ impl Vt {
                 }
             }
             State::SkipOne => self.state = State::Ground,
+        }
+    }
+
+    fn feed_c1_control(&mut self, byte: u8) -> bool {
+        match byte {
+            0x84 | 0x85 => {
+                self.break_clustering();
+                self.cx = 0;
+                self.linefeed();
+                true
+            }
+            0x88 => {
+                self.break_clustering();
+                self.cx = self.cx.saturating_sub(1);
+                true
+            }
+            0x8D => {
+                self.break_clustering();
+                if self.cy == self.scroll_top {
+                    self.scroll_down();
+                } else {
+                    self.cy = self.cy.saturating_sub(1);
+                }
+                true
+            }
+            0x9B => {
+                self.break_clustering();
+                self.state = State::Csi;
+                self.params.clear();
+                self.cur_param = None;
+                self.csi_private = false;
+                self.csi_greater = false;
+                self.csi_intermediate_space = false;
+                true
+            }
+            0x9D => {
+                self.break_clustering();
+                self.osc_buf.clear();
+                self.state = State::Osc;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -434,6 +486,7 @@ impl Vt {
                 self.params.clear();
                 self.cur_param = None;
                 self.csi_private = false;
+                self.csi_greater = false;
                 self.csi_intermediate_space = false;
             }
             ']' => {
@@ -484,7 +537,8 @@ impl Vt {
             }
             '?' => self.csi_private = true,
             ' ' => self.csi_intermediate_space = true,
-            '>' | '!' | '=' => {}
+            '>' => self.csi_greater = true,
+            '!' | '=' => {}
             '\u{40}'..='\u{7e}' => {
                 if let Some(p) = self.cur_param.take() {
                     self.params.push(p);
@@ -533,12 +587,25 @@ impl Vt {
                         self.dispatch_decrst(self.params[i]);
                     }
                 }
+                'n' if self.param(0, 0) == 6 => {
+                    let row = self.cy + 1;
+                    let col = self.cx + 1;
+                    let resp = format!("\x1b[?{row};{col}R");
+                    self.pending_response.extend_from_slice(resp.as_bytes());
+                }
                 _ => {}
             }
             return;
         }
 
         match final_ch {
+            'c' => {
+                if self.csi_greater {
+                    self.pending_response.extend_from_slice(b"\x1b[>0;1;0c");
+                } else {
+                    self.pending_response.extend_from_slice(b"\x1b[?1;2c");
+                }
+            }
             'A' => self.cy = self.cy.saturating_sub(self.param(0, 1) as usize),
             'B' | 'e' => self.cy = (self.cy + self.param(0, 1) as usize).min(self.rows - 1),
             'C' | 'a' => self.cx = (self.cx + self.param(0, 1) as usize).min(self.cols - 1),
@@ -1045,6 +1112,25 @@ mod tests {
     }
 
     #[test]
+    fn dec_private_dsr_cursor_position_report() {
+        let mut vt = Vt::new(20, 5);
+        vt.process("\x1b[2;4H".as_bytes());
+        vt.process("\x1b[?6n".as_bytes());
+        let resp = vt.take_response().unwrap();
+        assert_eq!(resp, b"\x1b[?2;4R");
+    }
+
+    #[test]
+    fn device_attribute_queries_are_answered() {
+        let mut vt = Vt::new(20, 5);
+        vt.process(b"\x1b[c");
+        assert_eq!(vt.take_response().unwrap(), b"\x1b[?1;2c");
+
+        vt.process(b"\x1b[>c");
+        assert_eq!(vt.take_response().unwrap(), b"\x1b[>0;1;0c");
+    }
+
+    #[test]
     fn osc_title_stored() {
         let mut vt = Vt::new(20, 2);
         vt.process(b"\x1b]0;my title\x07");
@@ -1324,11 +1410,25 @@ mod tests {
     }
 
     #[test]
+    fn eight_bit_csi_is_supported() {
+        let mut vt = Vt::new(20, 2);
+        vt.process(&[0x9B, b'3', b'1', b'm', b'X']);
+        assert_eq!(vt.render_cells()[0][0].fg, Color::Indexed(1));
+    }
+
+    #[test]
     fn osc_title_split_across_chunks() {
         let mut vt = Vt::new(20, 2);
         vt.process(b"\x1b]0;ti");
         vt.process(b"tle\x07X");
         assert_eq!(vt.render_cells()[0][0].ch(), 'X');
+    }
+
+    #[test]
+    fn eight_bit_osc_is_supported() {
+        let mut vt = Vt::new(20, 2);
+        vt.process(&[0x9D, b'0', b';', b't', b'i', b't', b'l', b'e', 0x07]);
+        assert_eq!(vt.title(), Some("title"));
     }
 
     #[test]
