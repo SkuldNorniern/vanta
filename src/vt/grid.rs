@@ -172,11 +172,20 @@ impl Vt {
         if let Some((row, col)) = self.pending_zwj.take() {
             if row == self.cy {
                 self.merge_into_cluster(row, col, ch);
+                self.ensure_cluster_width(row, col, width::char_width(ch).max(1));
                 if ch == '\u{200d}' {
                     self.pending_zwj = Some((row, col));
                 }
                 return;
             }
+        }
+
+        if width::is_emoji_modifier(ch) {
+            if self.append_to_previous(ch) {
+                return;
+            }
+            self.write_plain(ch, 2);
+            return;
         }
 
         let w = width::char_width(ch);
@@ -189,10 +198,7 @@ impl Vt {
             if let Some((row, col)) = self.pending_regional.take() {
                 if row == self.cy && col + 1 == self.cx {
                     self.merge_into_cluster(row, col, ch);
-                    self.screen[row][col].width = 2;
-                    if col + 1 < self.cols {
-                        self.screen[row][col + 1] = Cell::continuation();
-                    }
+                    self.ensure_cluster_width(row, col, 2);
                     self.cx = (self.cx + 1).min(self.cols);
                     return;
                 }
@@ -210,9 +216,14 @@ impl Vt {
     /// cluster of the cell immediately before the cursor. No base → dropped
     /// (fallback policy: never corrupt the grid for a stray combining mark).
     pub(super) fn append_combining(&mut self, ch: char) {
-        if self.cx == 0 {
+        if !self.append_to_previous(ch) {
             self.pending_zwj = None;
-            return;
+        }
+    }
+
+    fn append_to_previous(&mut self, ch: char) -> bool {
+        if self.cx == 0 {
+            return false;
         }
         let mut col = self.cx - 1;
         if matches!(self.screen[self.cy][col].kind, CellKind::Continuation) && col > 0 {
@@ -232,6 +243,19 @@ impl Vt {
         } else {
             None
         };
+        true
+    }
+
+    fn ensure_cluster_width(&mut self, row: usize, col: usize, width: u8) {
+        if width < 2 || self.screen[row][col].width == 2 || col + 1 >= self.cols {
+            return;
+        }
+        self.break_wide_at(row, col + 1);
+        self.screen[row][col].width = 2;
+        self.screen[row][col + 1] = Cell::continuation();
+        if row == self.cy && self.cx <= col + 1 {
+            self.cx = col + 2;
+        }
     }
 
     pub(super) fn merge_into_cluster(&mut self, row: usize, col: usize, ch: char) {

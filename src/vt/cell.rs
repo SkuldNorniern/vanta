@@ -11,7 +11,7 @@ pub enum Color {
 /// Text attribute bitset (bold/italic/underline/dim/blink/hidden/strike/inverse).
 /// Hand-rolled rather than pulling in a `bitflags` dependency.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub struct Attrs(pub(crate) u8);
+pub struct Attrs(pub(crate) u16);
 
 impl Attrs {
     pub const BOLD: Attrs = Attrs(1 << 0);
@@ -22,6 +22,7 @@ impl Attrs {
     pub const INVERSE: Attrs = Attrs(1 << 5);
     pub const HIDDEN: Attrs = Attrs(1 << 6);
     pub const STRIKE: Attrs = Attrs(1 << 7);
+    pub const OVERLINE: Attrs = Attrs(1 << 8);
 
     pub fn contains(self, flag: Attrs) -> bool {
         self.0 & flag.0 == flag.0

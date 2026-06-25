@@ -21,6 +21,26 @@ use std::str;
 const MAX_SCROLLBACK: usize = 5000;
 const TAB: usize = 8;
 
+/// Mouse reporting mode requested by DEC private mode sequences.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum MouseTracking {
+    #[default]
+    Off,
+    Press,
+    Drag,
+    Any,
+}
+
+/// Mouse coordinate encoding requested by DEC private mode sequences.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum MouseProtocol {
+    #[default]
+    X10,
+    Utf8,
+    Sgr,
+    Urxvt,
+}
+
 /// The current drawing pen applied to newly written glyphs.
 #[derive(Clone, Copy)]
 struct Pen {
@@ -133,6 +153,21 @@ pub struct Vt {
     /// DEC autowrap mode (DECAWM, mode 7).
     wraparound: bool,
 
+    /// DEC application cursor-key mode (DECCKM, mode 1).
+    application_cursor_keys: bool,
+
+    /// DEC application keypad mode (DECNKM, mode 66).
+    application_keypad: bool,
+
+    /// Whether focus in/out events should be reported (DECSET 1004).
+    focus_tracking: bool,
+
+    /// Mouse reporting mode requested by the child.
+    mouse_tracking: MouseTracking,
+
+    /// Mouse coordinate protocol requested by the child.
+    mouse_protocol: MouseProtocol,
+
     // ── DEC mode 2004: bracketed paste ────────────────────────────────────
     bracketed_paste: bool,
 }
@@ -171,6 +206,11 @@ impl Vt {
             cursor_visible: true,
             origin_mode: false,
             wraparound: true,
+            application_cursor_keys: false,
+            application_keypad: false,
+            focus_tracking: false,
+            mouse_tracking: MouseTracking::Off,
+            mouse_protocol: MouseProtocol::X10,
             bracketed_paste: false,
         }
     }
@@ -222,6 +262,31 @@ impl Vt {
     /// Whether bracketed paste mode is enabled (DECSET 2004).
     pub fn bracketed_paste_enabled(&self) -> bool {
         self.bracketed_paste
+    }
+
+    /// Whether application cursor-key mode (DECCKM) is enabled.
+    pub fn application_cursor_keys(&self) -> bool {
+        self.application_cursor_keys
+    }
+
+    /// Whether application keypad mode (DECNKM) is enabled.
+    pub fn application_keypad(&self) -> bool {
+        self.application_keypad
+    }
+
+    /// Whether focus in/out reporting (DECSET 1004) is enabled.
+    pub fn focus_tracking_enabled(&self) -> bool {
+        self.focus_tracking
+    }
+
+    /// Mouse reporting mode requested by the child.
+    pub fn mouse_tracking(&self) -> MouseTracking {
+        self.mouse_tracking
+    }
+
+    /// Mouse coordinate protocol requested by the child.
+    pub fn mouse_protocol(&self) -> MouseProtocol {
+        self.mouse_protocol
     }
 
     /// Decode `buf` as UTF-8, feeding complete scalars to [`Self::feed_char`].
@@ -509,7 +574,7 @@ impl Vt {
 
     fn dispatch_decset(&mut self, mode: u32) {
         match mode {
-            1 => {}
+            1 => self.application_cursor_keys = true,
             6 => {
                 self.origin_mode = true;
                 self.cx = 0;
@@ -517,8 +582,18 @@ impl Vt {
             }
             7 => self.wraparound = true,
             25 => self.cursor_visible = true,
+            66 => self.application_keypad = true,
             47 => self.enter_alt_screen(false),
+            1047 => self.enter_alt_screen(false),
+            1048 => self.decsc(),
             1049 => self.enter_alt_screen(true),
+            1000 => self.mouse_tracking = MouseTracking::Press,
+            1002 => self.mouse_tracking = MouseTracking::Drag,
+            1003 => self.mouse_tracking = MouseTracking::Any,
+            1004 => self.focus_tracking = true,
+            1005 => self.mouse_protocol = MouseProtocol::Utf8,
+            1006 => self.mouse_protocol = MouseProtocol::Sgr,
+            1015 => self.mouse_protocol = MouseProtocol::Urxvt,
             2004 => self.bracketed_paste = true,
             _ => {}
         }
@@ -526,7 +601,7 @@ impl Vt {
 
     fn dispatch_decrst(&mut self, mode: u32) {
         match mode {
-            1 => {}
+            1 => self.application_cursor_keys = false,
             6 => {
                 self.origin_mode = false;
                 self.cx = 0;
@@ -534,8 +609,28 @@ impl Vt {
             }
             7 => self.wraparound = false,
             25 => self.cursor_visible = false,
+            66 => self.application_keypad = false,
             47 => self.exit_alt_screen(false),
+            1047 => self.exit_alt_screen(false),
+            1048 => self.decrc(),
             1049 => self.exit_alt_screen(true),
+            1000 => {
+                if self.mouse_tracking == MouseTracking::Press {
+                    self.mouse_tracking = MouseTracking::Off;
+                }
+            }
+            1002 => {
+                if self.mouse_tracking == MouseTracking::Drag {
+                    self.mouse_tracking = MouseTracking::Off;
+                }
+            }
+            1003 => {
+                if self.mouse_tracking == MouseTracking::Any {
+                    self.mouse_tracking = MouseTracking::Off;
+                }
+            }
+            1004 => self.focus_tracking = false,
+            1005 | 1006 | 1015 => self.mouse_protocol = MouseProtocol::X10,
             2004 => self.bracketed_paste = false,
             _ => {}
         }
@@ -623,6 +718,8 @@ impl Vt {
                 27 => self.pen.attrs.set(Attrs::INVERSE, false),
                 28 => self.pen.attrs.set(Attrs::HIDDEN, false),
                 29 => self.pen.attrs.set(Attrs::STRIKE, false),
+                53 => self.pen.attrs.set(Attrs::OVERLINE, true),
+                55 => self.pen.attrs.set(Attrs::OVERLINE, false),
                 30..=37 => self.pen.fg = Color::Indexed((p - 30) as u8),
                 90..=97 => self.pen.fg = Color::Indexed((p - 90 + 8) as u8),
                 39 => self.pen.fg = Color::Default,
@@ -657,7 +754,7 @@ impl Vt {
 
 #[cfg(test)]
 mod tests {
-    use super::{Attrs, Cell, CellKind, Color, Vt};
+    use super::{Attrs, Cell, CellKind, Color, MouseProtocol, MouseTracking, Vt};
 
     fn render(input: &str) -> String {
         let mut vt = Vt::new(20, 5);
@@ -753,14 +850,16 @@ mod tests {
     #[test]
     fn sgr_text_attributes() {
         let mut vt = Vt::new(20, 2);
-        vt.process("\u{1b}[1;3;4;9mX\u{1b}[22;23;24;29mY".as_bytes());
+        vt.process("\u{1b}[1;3;4;9;53mX\u{1b}[22;23;24;29;55mY".as_bytes());
         let cells = vt.render_cells();
         assert!(cells[0][0].attrs.contains(Attrs::BOLD));
         assert!(cells[0][0].attrs.contains(Attrs::ITALIC));
         assert!(cells[0][0].attrs.contains(Attrs::UNDERLINE));
         assert!(cells[0][0].attrs.contains(Attrs::STRIKE));
+        assert!(cells[0][0].attrs.contains(Attrs::OVERLINE));
         assert!(!cells[0][1].attrs.contains(Attrs::BOLD));
         assert!(!cells[0][1].attrs.contains(Attrs::ITALIC));
+        assert!(!cells[0][1].attrs.contains(Attrs::OVERLINE));
     }
 
     #[test]
@@ -916,6 +1015,25 @@ mod tests {
     }
 
     #[test]
+    fn terminal_mode_toggles_are_tracked() {
+        let mut vt = Vt::new(20, 2);
+        vt.process(b"\x1b[?1;66;1004;1006h");
+        assert!(vt.application_cursor_keys());
+        assert!(vt.application_keypad());
+        assert!(vt.focus_tracking_enabled());
+        assert_eq!(vt.mouse_protocol(), MouseProtocol::Sgr);
+
+        vt.process(b"\x1b[?1002h");
+        assert_eq!(vt.mouse_tracking(), MouseTracking::Drag);
+        vt.process(b"\x1b[?1002l\x1b[?1;66;1004;1006l");
+        assert!(!vt.application_cursor_keys());
+        assert!(!vt.application_keypad());
+        assert!(!vt.focus_tracking_enabled());
+        assert_eq!(vt.mouse_tracking(), MouseTracking::Off);
+        assert_eq!(vt.mouse_protocol(), MouseProtocol::X10);
+    }
+
+    #[test]
     fn origin_mode_positions_relative_to_scroll_region() {
         let mut vt = Vt::new(10, 5);
         vt.process(b"\x1b[2;4r\x1b[?6h\x1b[1;1HX");
@@ -1021,6 +1139,49 @@ mod tests {
         assert!(is_continuation(&cells[0][1]));
         assert_eq!(cluster_text(&cells[0][0]), "\u{1f9d1}\u{200d}\u{1f4bb}");
         assert!(cells[0].get(2).is_none());
+    }
+
+    #[test]
+    fn emoji_modifier_stays_in_base_cell() {
+        let mut vt = Vt::new(20, 2);
+        vt.process("\u{1f44b}\u{1f3fd}X".as_bytes());
+        let cells = vt.render_cells();
+        assert_eq!(cells[0][0].width, 2);
+        assert!(is_continuation(&cells[0][1]));
+        assert_eq!(cluster_text(&cells[0][0]), "\u{1f44b}\u{1f3fd}");
+        assert_eq!(cells[0][2].ch(), 'X');
+    }
+
+    #[test]
+    fn emoji_tag_sequence_stays_in_base_cell() {
+        let mut vt = Vt::new(20, 2);
+        vt.process("\u{1f3f4}\u{e0067}\u{e0062}\u{e007f}X".as_bytes());
+        let cells = vt.render_cells();
+        assert_eq!(cells[0][0].width, 2);
+        assert!(is_continuation(&cells[0][1]));
+        assert_eq!(
+            cluster_text(&cells[0][0]),
+            "\u{1f3f4}\u{e0067}\u{e0062}\u{e007f}"
+        );
+        assert_eq!(cells[0][2].ch(), 'X');
+    }
+
+    #[test]
+    fn supplemental_variation_selector_stays_zero_width() {
+        let mut vt = Vt::new(20, 2);
+        vt.process("A\u{e0100}B".as_bytes());
+        let cells = vt.render_cells();
+        assert_eq!(cluster_text(&cells[0][0]), "A\u{e0100}");
+        assert_eq!(cells[0][1].ch(), 'B');
+    }
+
+    #[test]
+    fn additional_combining_marks_stay_in_base_cell() {
+        let mut vt = Vt::new(20, 2);
+        vt.process("\u{0915}\u{093c}X".as_bytes());
+        let cells = vt.render_cells();
+        assert_eq!(cluster_text(&cells[0][0]), "\u{0915}\u{093c}");
+        assert_eq!(cells[0][1].ch(), 'X');
     }
 
     #[test]

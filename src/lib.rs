@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use vt::Vt;
-pub use vt::{Cell, CellKind, Color};
+pub use vt::{Cell, CellKind, Color, MouseProtocol, MouseTracking};
 
 pub use pty::SpawnConfig;
 
@@ -44,6 +44,16 @@ pub struct Snapshot {
     pub is_alt_screen: bool,
     /// Whether bracketed paste mode (DECSET 2004) is enabled.
     pub bracketed_paste: bool,
+    /// Whether application cursor-key mode (DECCKM) is enabled.
+    pub application_cursor_keys: bool,
+    /// Whether application keypad mode (DECNKM) is enabled.
+    pub application_keypad: bool,
+    /// Whether focus in/out reporting (DECSET 1004) is enabled.
+    pub focus_tracking: bool,
+    /// Mouse reporting mode requested by the child.
+    pub mouse_tracking: MouseTracking,
+    /// Mouse coordinate protocol requested by the child.
+    pub mouse_protocol: MouseProtocol,
 }
 
 impl Snapshot {
@@ -216,6 +226,11 @@ impl Terminal {
                 cursor_visible: v.cursor_visible(),
                 is_alt_screen: v.on_alt_screen(),
                 bracketed_paste: v.bracketed_paste_enabled(),
+                application_cursor_keys: v.application_cursor_keys(),
+                application_keypad: v.application_keypad(),
+                focus_tracking: v.focus_tracking_enabled(),
+                mouse_tracking: v.mouse_tracking(),
+                mouse_protocol: v.mouse_protocol(),
             })
             .unwrap_or_else(|_| Snapshot {
                 screen: Vec::new(),
@@ -227,6 +242,11 @@ impl Terminal {
                 cursor_visible: true,
                 is_alt_screen: false,
                 bracketed_paste: false,
+                application_cursor_keys: false,
+                application_keypad: false,
+                focus_tracking: false,
+                mouse_tracking: MouseTracking::Off,
+                mouse_protocol: MouseProtocol::X10,
             })
     }
 
