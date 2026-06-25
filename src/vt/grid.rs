@@ -17,10 +17,11 @@ pub(super) fn parse_extended(rest: &[u32]) -> Option<(Color, usize)> {
     match rest.first().copied() {
         Some(5) => rest.get(1).map(|&idx| (Color::Indexed(idx as u8), 2)),
         Some(2) => {
-            let r = *rest.get(1)? as u8;
-            let g = *rest.get(2)? as u8;
-            let b = *rest.get(3)? as u8;
-            Some((Color::Rgb(r, g, b), 4))
+            let offset = usize::from(rest.len() >= 5 && rest.get(1) == Some(&0));
+            let r = *rest.get(1 + offset)? as u8;
+            let g = *rest.get(2 + offset)? as u8;
+            let b = *rest.get(3 + offset)? as u8;
+            Some((Color::Rgb(r, g, b), 4 + offset))
         }
         _ => None,
     }

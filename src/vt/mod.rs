@@ -41,21 +41,36 @@ pub enum MouseProtocol {
     Urxvt,
 }
 
+/// Cursor shape requested via DECSCUSR (`CSI Ps SP q`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum CursorStyle {
+    #[default]
+    Default,
+    BlinkingBlock,
+    SteadyBlock,
+    BlinkingUnderline,
+    SteadyUnderline,
+    BlinkingBar,
+    SteadyBar,
+}
+
 /// The current drawing pen applied to newly written glyphs.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Pen {
     fg: Color,
     bg: Color,
     underline_color: Color,
+    hyperlink: Option<Box<str>>,
     attrs: Attrs,
 }
 
 impl Pen {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
             fg: Color::Default,
             bg: Color::Default,
             underline_color: Color::Default,
+            hyperlink: None,
             attrs: Attrs(0),
         }
     }
@@ -77,6 +92,7 @@ impl Pen {
             fg: self.fg,
             bg: self.bg,
             underline_color: self.underline_color,
+            hyperlink: self.hyperlink.clone(),
             attrs: self.attrs,
         }
     }
@@ -109,6 +125,8 @@ pub struct Vt {
     cur_param: Option<u32>,
     /// Set when CSI was introduced with `?` (DEC private mode sequences).
     csi_private: bool,
+    /// Set when CSI includes a space intermediate byte (e.g. DECSCUSR).
+    csi_intermediate_space: bool,
     /// Trailing bytes of an as-yet-incomplete UTF-8 sequence, held over to the
     /// next `process` call (a multi-byte scalar can be split across reads).
     pending_utf8: Vec<u8>,
@@ -153,6 +171,9 @@ pub struct Vt {
     /// DEC autowrap mode (DECAWM, mode 7).
     wraparound: bool,
 
+    /// Cursor shape requested via DECSCUSR.
+    cursor_style: CursorStyle,
+
     /// DEC application cursor-key mode (DECCKM, mode 1).
     application_cursor_keys: bool,
 
@@ -188,6 +209,7 @@ impl Vt {
             params: Vec::new(),
             cur_param: None,
             csi_private: false,
+            csi_intermediate_space: false,
             pending_utf8: Vec::new(),
             pending_zwj: None,
             pending_regional: None,
@@ -206,6 +228,7 @@ impl Vt {
             cursor_visible: true,
             origin_mode: false,
             wraparound: true,
+            cursor_style: CursorStyle::Default,
             application_cursor_keys: false,
             application_keypad: false,
             focus_tracking: false,
@@ -252,6 +275,11 @@ impl Vt {
     /// Whether the cursor should be displayed (DECTCEM, DECSET/DECRST 25).
     pub fn cursor_visible(&self) -> bool {
         self.cursor_visible
+    }
+
+    /// Cursor style requested via DECSCUSR.
+    pub fn cursor_style(&self) -> CursorStyle {
+        self.cursor_style
     }
 
     /// Whether the alternate screen is currently active (DECSET 47 / 1049).
@@ -356,6 +384,14 @@ impl Vt {
         let buf = mem::take(&mut self.osc_buf);
         if buf.starts_with("0;") || buf.starts_with("2;") {
             self.title = Some(buf[2..].to_owned());
+        } else if let Some(rest) = buf.strip_prefix("8;") {
+            if let Some((_, uri)) = rest.split_once(';') {
+                self.pen.hyperlink = if uri.is_empty() {
+                    None
+                } else {
+                    Some(uri.to_owned().into_boxed_str())
+                };
+            }
         }
     }
 
@@ -398,6 +434,7 @@ impl Vt {
                 self.params.clear();
                 self.cur_param = None;
                 self.csi_private = false;
+                self.csi_intermediate_space = false;
             }
             ']' => {
                 self.osc_buf.clear();
@@ -442,10 +479,11 @@ impl Vt {
                 let d = ch as u32 - '0' as u32;
                 self.cur_param = Some(self.cur_param.unwrap_or(0) * 10 + d);
             }
-            ';' => {
+            ';' | ':' => {
                 self.params.push(self.cur_param.take().unwrap_or(0));
             }
             '?' => self.csi_private = true,
+            ' ' => self.csi_intermediate_space = true,
             '>' | '!' | '=' => {}
             '\u{40}'..='\u{7e}' => {
                 if let Some(p) = self.cur_param.take() {
@@ -467,6 +505,22 @@ impl Vt {
     }
 
     fn dispatch_csi(&mut self, final_ch: char) {
+        if self.csi_intermediate_space {
+            if final_ch == 'q' {
+                self.cursor_style = match self.param(0, 0) {
+                    0 => CursorStyle::Default,
+                    1 => CursorStyle::BlinkingBlock,
+                    2 => CursorStyle::SteadyBlock,
+                    3 => CursorStyle::BlinkingUnderline,
+                    4 => CursorStyle::SteadyUnderline,
+                    5 => CursorStyle::BlinkingBar,
+                    6 => CursorStyle::SteadyBar,
+                    _ => self.cursor_style,
+                };
+            }
+            return;
+        }
+
         if self.csi_private {
             match final_ch {
                 'h' => {
@@ -639,7 +693,7 @@ impl Vt {
     fn decsc(&mut self) {
         self.saved_cx = self.cx;
         self.saved_cy = self.cy;
-        self.saved_pen = self.pen;
+        self.saved_pen = self.pen.clone();
         self.has_saved_cursor = true;
     }
 
@@ -647,7 +701,7 @@ impl Vt {
         if self.has_saved_cursor {
             self.cx = self.saved_cx.min(self.cols - 1);
             self.cy = self.saved_cy.min(self.rows - 1);
-            self.pen = self.saved_pen;
+            self.pen = self.saved_pen.clone();
         }
     }
 
@@ -754,7 +808,7 @@ impl Vt {
 
 #[cfg(test)]
 mod tests {
-    use super::{Attrs, Cell, CellKind, Color, MouseProtocol, MouseTracking, Vt};
+    use super::{Attrs, Cell, CellKind, Color, CursorStyle, MouseProtocol, MouseTracking, Vt};
 
     fn render(input: &str) -> String {
         let mut vt = Vt::new(20, 5);
@@ -827,6 +881,15 @@ mod tests {
         let cells = vt.render_cells();
         assert_eq!(cells[0][0].fg, Color::Rgb(10, 20, 30));
         assert_eq!(cells[0][1].fg, Color::Indexed(200));
+    }
+
+    #[test]
+    fn sgr_colon_truecolor_forms() {
+        let mut vt = Vt::new(20, 2);
+        vt.process("\u{1b}[38:2::10:20:30mX\u{1b}[48:2:40:50:60mY".as_bytes());
+        let cells = vt.render_cells();
+        assert_eq!(cells[0][0].fg, Color::Rgb(10, 20, 30));
+        assert_eq!(cells[0][1].bg, Color::Rgb(40, 50, 60));
     }
 
     #[test]
@@ -989,6 +1052,22 @@ mod tests {
     }
 
     #[test]
+    fn osc8_hyperlink_is_stored_on_cells() {
+        let mut vt = Vt::new(20, 2);
+        vt.process(b"\x1b]8;;https://example.test\x1b\\link\x1b]8;;\x1b\\ plain");
+        let cells = vt.render_cells();
+        assert_eq!(
+            cells[0][0].hyperlink.as_deref(),
+            Some("https://example.test")
+        );
+        assert_eq!(
+            cells[0][3].hyperlink.as_deref(),
+            Some("https://example.test")
+        );
+        assert_eq!(cells[0][4].hyperlink, None);
+    }
+
+    #[test]
     fn osc_st_terminator_consumes_both_bytes() {
         let mut vt = Vt::new(20, 2);
         vt.process(b"\x1b]0;title\x1b\\X");
@@ -1012,6 +1091,18 @@ mod tests {
         assert!(!vt.cursor_visible());
         vt.process(b"\x1b[?25h");
         assert!(vt.cursor_visible());
+    }
+
+    #[test]
+    fn cursor_style_is_tracked() {
+        let mut vt = Vt::new(20, 2);
+        assert_eq!(vt.cursor_style(), CursorStyle::Default);
+        vt.process(b"\x1b[5 q");
+        assert_eq!(vt.cursor_style(), CursorStyle::BlinkingBar);
+        vt.process(b"\x1b[2 q");
+        assert_eq!(vt.cursor_style(), CursorStyle::SteadyBlock);
+        vt.process(b"\x1b[0 q");
+        assert_eq!(vt.cursor_style(), CursorStyle::Default);
     }
 
     #[test]

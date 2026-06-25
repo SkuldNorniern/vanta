@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use vt::Vt;
-pub use vt::{Cell, CellKind, Color, MouseProtocol, MouseTracking};
+pub use vt::{Cell, CellKind, Color, CursorStyle, MouseProtocol, MouseTracking};
 
 pub use pty::SpawnConfig;
 
@@ -40,6 +40,8 @@ pub struct Snapshot {
     /// TUI apps hide the cursor and render their own; respecting this flag
     /// avoids a ghost cursor block drawn on top of the app's own cursor.
     pub cursor_visible: bool,
+    /// Cursor shape requested via DECSCUSR (`CSI Ps SP q`).
+    pub cursor_style: CursorStyle,
     /// Whether the alternate screen (DECSET 47/1049) is active.
     pub is_alt_screen: bool,
     /// Whether bracketed paste mode (DECSET 2004) is enabled.
@@ -224,6 +226,7 @@ impl Terminal {
                 title: v.title().map(str::to_owned),
                 closed,
                 cursor_visible: v.cursor_visible(),
+                cursor_style: v.cursor_style(),
                 is_alt_screen: v.on_alt_screen(),
                 bracketed_paste: v.bracketed_paste_enabled(),
                 application_cursor_keys: v.application_cursor_keys(),
@@ -240,6 +243,7 @@ impl Terminal {
                 title: None,
                 closed,
                 cursor_visible: true,
+                cursor_style: CursorStyle::Default,
                 is_alt_screen: false,
                 bracketed_paste: false,
                 application_cursor_keys: false,

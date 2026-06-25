@@ -65,6 +65,8 @@ pub struct Cell {
     /// by LSP-style squiggly diagnostics in modern editors/terminals.
     /// `Color::Default` means "same as `fg`".
     pub underline_color: Color,
+    /// OSC 8 hyperlink URI active for this cell, if any.
+    pub hyperlink: Option<Box<str>>,
     pub attrs: Attrs,
 }
 
@@ -76,6 +78,7 @@ impl Cell {
             fg: Color::Default,
             bg: Color::Default,
             underline_color: Color::Default,
+            hyperlink: None,
             attrs: Attrs::default(),
         }
     }
@@ -87,6 +90,7 @@ impl Cell {
             fg: Color::Default,
             bg: Color::Default,
             underline_color: Color::Default,
+            hyperlink: None,
             attrs: Attrs::default(),
         }
     }
