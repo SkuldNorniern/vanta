@@ -60,6 +60,18 @@ fn trim_cells(row: &[Cell]) -> Vec<Cell> {
 }
 
 impl Vt {
+    fn erase_cells(&mut self, row: usize, start: usize, end: usize, blank: &Cell) {
+        let end = end.min(self.cols);
+        if row >= self.rows || start >= end {
+            return;
+        }
+        self.break_wide_at(row, start);
+        self.break_wide_at(row, end.saturating_sub(1));
+        for cell in &mut self.screen[row][start..end] {
+            *cell = blank.clone();
+        }
+    }
+
     /// Insert `n` blank lines at the cursor row (within the scroll region).
     pub(super) fn insert_lines(&mut self, n: usize) {
         if self.cy < self.scroll_top || self.cy > self.scroll_bottom {
@@ -115,30 +127,20 @@ impl Vt {
         let blank = self.pen.cell(' ');
         match mode {
             0 => {
-                for c in self.cx..self.cols {
-                    self.screen[self.cy][c] = blank.clone();
-                }
+                self.erase_cells(self.cy, self.cx, self.cols, &blank);
                 for r in (self.cy + 1)..self.rows {
-                    for c in 0..self.cols {
-                        self.screen[r][c] = blank.clone();
-                    }
+                    self.erase_cells(r, 0, self.cols, &blank);
                 }
             }
             1 => {
                 for r in 0..self.cy {
-                    for c in 0..self.cols {
-                        self.screen[r][c] = blank.clone();
-                    }
+                    self.erase_cells(r, 0, self.cols, &blank);
                 }
-                for c in 0..=self.cx.min(self.cols - 1) {
-                    self.screen[self.cy][c] = blank.clone();
-                }
+                self.erase_cells(self.cy, 0, self.cx.min(self.cols - 1) + 1, &blank);
             }
             _ => {
-                for row in &mut self.screen {
-                    for c in row.iter_mut() {
-                        *c = blank.clone();
-                    }
+                for r in 0..self.rows {
+                    self.erase_cells(r, 0, self.cols, &blank);
                 }
                 if mode == 3 {
                     self.scrollback.clear();
@@ -149,23 +151,16 @@ impl Vt {
 
     pub(super) fn erase_line(&mut self, mode: u32) {
         let blank = self.pen.cell(' ');
-        let row = &mut self.screen[self.cy];
         match mode {
             0 => {
-                for cell in &mut row[self.cx..self.cols] {
-                    *cell = blank.clone();
-                }
+                self.erase_cells(self.cy, self.cx, self.cols, &blank);
             }
             1 => {
                 let end = self.cx.min(self.cols - 1);
-                for cell in &mut row[0..=end] {
-                    *cell = blank.clone();
-                }
+                self.erase_cells(self.cy, 0, end + 1, &blank);
             }
             _ => {
-                for c in row.iter_mut() {
-                    *c = blank.clone();
-                }
+                self.erase_cells(self.cy, 0, self.cols, &blank);
             }
         }
     }
@@ -261,10 +256,18 @@ impl Vt {
     /// wrapping first if it doesn't fit and clearing any wide-glyph half it
     /// overwrites.
     pub(super) fn write_plain(&mut self, ch: char, w: u8) {
-        if self.cx >= self.cols || (w == 2 && self.cx + 1 >= self.cols) {
+        if self.wraparound && (self.cx >= self.cols || (w == 2 && self.cx + 1 >= self.cols)) {
             self.cx = 0;
             self.linefeed();
         }
+        if self.cx >= self.cols {
+            self.cx = self.cols - 1;
+        }
+        let w = if w == 2 && self.cx + 1 >= self.cols {
+            1
+        } else {
+            w
+        };
         self.break_wide_at(self.cy, self.cx);
         if w == 2 && self.cx + 1 < self.cols {
             self.break_wide_at(self.cy, self.cx + 1);

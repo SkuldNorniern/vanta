@@ -159,6 +159,31 @@ impl Terminal {
         self.pty_io(|p| p.write(bytes))
     }
 
+    /// Paste bytes into the terminal, wrapping them in bracketed-paste markers
+    /// when the child has enabled DECSET 2004.
+    pub fn paste_bytes(&self, bytes: &[u8]) -> io::Result<()> {
+        let bracketed = self
+            .vt
+            .lock()
+            .map(|v| v.bracketed_paste_enabled())
+            .unwrap_or(false);
+        if bracketed {
+            self.pty_io(|p| {
+                p.write(b"\x1b[200~")?;
+                p.write(bytes)?;
+                p.write(b"\x1b[201~")
+            })
+        } else {
+            self.write_bytes(bytes)
+        }
+    }
+
+    /// Paste UTF-8 text into the terminal. See [`Terminal::paste_bytes`] for
+    /// bracketed-paste behavior.
+    pub fn paste_str(&self, s: &str) -> io::Result<()> {
+        self.paste_bytes(s.as_bytes())
+    }
+
     /// Resize the PTY and the VT grid to `cols` x `rows` character cells.
     pub fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
         let cols = cols.max(1);
@@ -288,4 +313,80 @@ fn spawn_reader<R: Read + Send + 'static>(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    struct RecordingPty {
+        writes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl pty::Pty for RecordingPty {
+        fn take_reader(&mut self) -> Option<Box<dyn Read + Send>> {
+            Some(Box::new(Cursor::new(Vec::new())))
+        }
+
+        fn write(&self, data: &[u8]) -> io::Result<()> {
+            self.writes.lock().unwrap().extend_from_slice(data);
+            Ok(())
+        }
+
+        fn resize(&self, _cols: u16, _rows: u16) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn is_running(&self) -> bool {
+            true
+        }
+
+        fn try_wait(&self) -> io::Result<Option<pty::ExitStatus>> {
+            Ok(None)
+        }
+
+        fn kill(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn close_input(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn recording_terminal() -> (Terminal, Arc<Mutex<Vec<u8>>>) {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let pty: Box<dyn pty::Pty> = Box::new(RecordingPty {
+            writes: writes.clone(),
+        });
+        (
+            Terminal {
+                pty: Arc::new(Mutex::new(pty)),
+                vt: Arc::new(Mutex::new(Vt::new(10, 2))),
+                version: Arc::new(AtomicU64::new(0)),
+                closed: Arc::new(AtomicBool::new(false)),
+            },
+            writes,
+        )
+    }
+
+    #[test]
+    fn paste_bytes_wraps_when_bracketed_paste_is_enabled() {
+        let (term, writes) = recording_terminal();
+        term.vt.lock().unwrap().process(b"\x1b[?2004h");
+
+        term.paste_bytes(b"hello").unwrap();
+
+        assert_eq!(&*writes.lock().unwrap(), b"\x1b[200~hello\x1b[201~");
+    }
+
+    #[test]
+    fn paste_bytes_writes_plain_data_without_bracketed_paste() {
+        let (term, writes) = recording_terminal();
+
+        term.paste_bytes(b"hello").unwrap();
+
+        assert_eq!(&*writes.lock().unwrap(), b"hello");
+    }
 }

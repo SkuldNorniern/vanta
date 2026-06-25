@@ -128,6 +128,10 @@ pub struct Vt {
 
     // ── DEC cursor-visibility mode (DECTCEM, mode 25) ──────────────────────
     cursor_visible: bool,
+    /// DEC origin mode (DECOM, mode 6): CUP/HVP row is relative to scroll_top.
+    origin_mode: bool,
+    /// DEC autowrap mode (DECAWM, mode 7).
+    wraparound: bool,
 
     // ── DEC mode 2004: bracketed paste ────────────────────────────────────
     bracketed_paste: bool,
@@ -165,6 +169,8 @@ impl Vt {
             osc_buf: String::new(),
             title: None,
             cursor_visible: true,
+            origin_mode: false,
+            wraparound: true,
             bracketed_paste: false,
         }
     }
@@ -380,6 +386,7 @@ impl Vt {
                 if let Some(p) = self.cur_param.take() {
                     self.params.push(p);
                 }
+                self.break_clustering();
                 self.dispatch_csi(ch);
                 self.state = State::Ground;
             }
@@ -428,7 +435,12 @@ impl Vt {
             'G' | '`' => self.cx = (self.param(0, 1) as usize - 1).min(self.cols - 1),
             'd' => self.cy = (self.param(0, 1) as usize - 1).min(self.rows - 1),
             'H' | 'f' => {
-                self.cy = (self.param(0, 1) as usize - 1).min(self.rows - 1);
+                let row = self.param(0, 1) as usize - 1;
+                self.cy = if self.origin_mode {
+                    (self.scroll_top + row).min(self.scroll_bottom)
+                } else {
+                    row.min(self.rows - 1)
+                };
                 self.cx = (self.param(1, 1) as usize - 1).min(self.cols - 1);
             }
             'J' => self.erase_display(self.param(0, 0)),
@@ -471,6 +483,10 @@ impl Vt {
                 let n = self.param(0, 1) as usize;
                 let blank = self.pen.cell(' ');
                 let end = (self.cx + n).min(self.cols);
+                if self.cx < end {
+                    self.break_wide_at(self.cy, self.cx);
+                    self.break_wide_at(self.cy, end.saturating_sub(1));
+                }
                 for c in self.cx..end {
                     self.screen[self.cy][c] = blank.clone();
                 }
@@ -494,6 +510,12 @@ impl Vt {
     fn dispatch_decset(&mut self, mode: u32) {
         match mode {
             1 => {}
+            6 => {
+                self.origin_mode = true;
+                self.cx = 0;
+                self.cy = self.scroll_top;
+            }
+            7 => self.wraparound = true,
             25 => self.cursor_visible = true,
             47 => self.enter_alt_screen(false),
             1049 => self.enter_alt_screen(true),
@@ -505,6 +527,12 @@ impl Vt {
     fn dispatch_decrst(&mut self, mode: u32) {
         match mode {
             1 => {}
+            6 => {
+                self.origin_mode = false;
+                self.cx = 0;
+                self.cy = 0;
+            }
+            7 => self.wraparound = false,
             25 => self.cursor_visible = false,
             47 => self.exit_alt_screen(false),
             1049 => self.exit_alt_screen(true),
@@ -547,6 +575,7 @@ impl Vt {
         self.cy = 0;
         self.scroll_top = 0;
         self.scroll_bottom = self.rows - 1;
+        self.origin_mode = false;
         self.alt_active = true;
     }
 
@@ -559,6 +588,7 @@ impl Vt {
         self.saved_scrollback.clear();
         self.scroll_top = 0;
         self.scroll_bottom = self.rows - 1;
+        self.origin_mode = false;
         self.alt_active = false;
         if restore_cursor {
             self.decrc();
@@ -883,6 +913,51 @@ mod tests {
         assert!(!vt.cursor_visible());
         vt.process(b"\x1b[?25h");
         assert!(vt.cursor_visible());
+    }
+
+    #[test]
+    fn origin_mode_positions_relative_to_scroll_region() {
+        let mut vt = Vt::new(10, 5);
+        vt.process(b"\x1b[2;4r\x1b[?6h\x1b[1;1HX");
+        let cells = vt.render_cells();
+        assert_eq!(cells[1][0].ch(), 'X');
+        assert_eq!(vt.cursor(), (1, 1));
+
+        vt.process(b"\x1b[?6l\x1b[1;1HY");
+        let cells = vt.render_cells();
+        assert_eq!(cells[0][0].ch(), 'Y');
+    }
+
+    #[test]
+    fn wraparound_mode_can_be_disabled() {
+        let mut vt = Vt::new(3, 2);
+        vt.process(b"\x1b[?7labcd");
+        let cells = vt.render_cells();
+        assert_eq!(cells[0][0].ch(), 'a');
+        assert_eq!(cells[0][1].ch(), 'b');
+        assert_eq!(cells[0][2].ch(), 'd');
+        assert!(cells[1].is_empty());
+    }
+
+    #[test]
+    fn csi_breaks_regional_indicator_pairing() {
+        let mut vt = Vt::new(20, 2);
+        vt.process("\u{1f1f0}\x1b[1C\u{1f1f7}".as_bytes());
+        let cells = vt.render_cells();
+        assert_eq!(cells[0][0].width, 1);
+        assert_eq!(cells[0][2].width, 1);
+    }
+
+    #[test]
+    fn erase_character_clears_partial_wide_glyph() {
+        let mut vt = Vt::new(5, 2);
+        vt.process("A\u{d55c}B".as_bytes());
+        vt.process(b"\x1b[1;2H\x1b[1X");
+        let cells = vt.render_cells();
+        assert_eq!(cells[0][0].ch(), 'A');
+        assert_eq!(cells[0][1].ch(), ' ');
+        assert_eq!(cells[0][2].ch(), ' ');
+        assert_eq!(cells[0][3].ch(), 'B');
     }
 
     #[test]
