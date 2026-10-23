@@ -900,6 +900,17 @@ mod tests {
     }
 
     #[test]
+    fn window_is_a_slice_of_scrollback_then_screen() {
+        let mut vt = Vt::new(10, 3);
+        vt.process(b"a\r\nb\r\nc\r\nd\r\ne");
+        let mut all = vt.scrollback_cells();
+        all.extend(vt.screen_cells());
+        assert_eq!(vt.line_count(), all.len());
+        assert_eq!(vt.cells_window(1, 2), all[1..3].to_vec());
+        assert!(vt.cells_window(99, 2).is_empty());
+    }
+
+    #[test]
     fn carriage_return_overwrites() {
         assert_eq!(render("abc\rX").lines().next().unwrap(), "Xbc");
     }

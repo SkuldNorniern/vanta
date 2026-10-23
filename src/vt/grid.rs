@@ -419,4 +419,22 @@ impl Vt {
     pub fn scrollback_cells(&self) -> Vec<Vec<Cell>> {
         self.scrollback.iter().map(|row| trim_cells(row)).collect()
     }
+
+    /// Lines in scrollback plus screen.
+    pub fn line_count(&self) -> usize {
+        self.scrollback.len() + self.screen.len()
+    }
+
+    /// Up to `count` lines from `first`, counted over scrollback then screen
+    /// (the order of [`Self::cursor`]), trailing blank cells trimmed. Lets a
+    /// renderer copy only the lines it shows.
+    pub fn cells_window(&self, first: usize, count: usize) -> Vec<Vec<Cell>> {
+        self.scrollback
+            .iter()
+            .chain(&self.screen)
+            .skip(first)
+            .take(count)
+            .map(|row| trim_cells(row))
+            .collect()
+    }
 }

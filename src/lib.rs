@@ -87,6 +87,25 @@ impl Snapshot {
     }
 }
 
+/// A slice of the terminal's lines plus the state a renderer needs, read
+/// under one lock. From [`Terminal::window`].
+pub struct Window {
+    /// Lines in scrollback plus screen.
+    pub lines: usize,
+    /// The requested lines, trailing blank cells trimmed.
+    pub rows: Vec<Vec<Cell>>,
+    /// The cursor's absolute `(line, col)`, same numbering as `lines`.
+    pub cursor: (usize, usize),
+    /// The [`Terminal::version`] this was read at.
+    pub version: u64,
+    pub cursor_visible: bool,
+    pub is_alt_screen: bool,
+    pub bracketed_paste: bool,
+    pub application_cursor_keys: bool,
+    /// Whether the PTY output stream has reached EOF.
+    pub closed: bool,
+}
+
 /// A running shell on a PTY, with its output rendered through a VT grid.
 pub struct Terminal {
     pty: Arc<Mutex<Box<dyn pty::Pty>>>,
@@ -117,6 +136,16 @@ impl Terminal {
 
     /// Spawn `config` on a PTY using the compiled-in backend.
     pub fn spawn_with_config(config: &SpawnConfig) -> io::Result<Self> {
+        Self::spawn_notify(config, || {})
+    }
+
+    /// Like [`Self::spawn_with_config`], and `on_output` runs on the reader
+    /// thread after each processed chunk and once at EOF, so a GUI can wake
+    /// and redraw instead of polling [`Self::version`].
+    pub fn spawn_notify(
+        config: &SpawnConfig,
+        on_output: impl Fn() + Send + 'static,
+    ) -> io::Result<Self> {
         let mut pty = pty::spawn(config)?;
         let reader = pty
             .take_reader()
@@ -136,6 +165,7 @@ impl Terminal {
             version.clone(),
             pty.clone(),
             closed.clone(),
+            on_output,
         );
         Ok(Self {
             pty,
@@ -254,6 +284,38 @@ impl Terminal {
             })
     }
 
+    /// Up to `count` lines from `first` with the cursor and modes, all read
+    /// under one lock. Unlike [`Self::snapshot`] it copies only those lines,
+    /// not the whole scrollback.
+    pub fn window(&self, first: usize, count: usize) -> Window {
+        let closed = self.closed.load(Ordering::Acquire);
+        let version = self.version.load(Ordering::Acquire);
+        self.vt
+            .lock()
+            .map(|v| Window {
+                lines: v.line_count(),
+                rows: v.cells_window(first, count),
+                cursor: v.cursor(),
+                version,
+                cursor_visible: v.cursor_visible(),
+                is_alt_screen: v.on_alt_screen(),
+                bracketed_paste: v.bracketed_paste_enabled(),
+                application_cursor_keys: v.application_cursor_keys(),
+                closed,
+            })
+            .unwrap_or(Window {
+                lines: 0,
+                rows: Vec::new(),
+                cursor: (0, 0),
+                version,
+                cursor_visible: true,
+                is_alt_screen: false,
+                bracketed_paste: false,
+                application_cursor_keys: false,
+                closed,
+            })
+    }
+
     /// The current window title set by the shell via OSC 0/2, if any.
     ///
     /// For UI update loops, prefer [`Snapshot::title`] from [`Terminal::snapshot`]
@@ -304,6 +366,7 @@ fn spawn_reader<R: Read + Send + 'static>(
     version: Arc<AtomicU64>,
     pty: Arc<Mutex<Box<dyn pty::Pty>>>,
     closed: Arc<AtomicBool>,
+    on_output: impl Fn() + Send + 'static,
 ) {
     thread::spawn(move || {
         let mut buf = [0u8; 4096];
@@ -312,6 +375,7 @@ fn spawn_reader<R: Read + Send + 'static>(
                 Ok(0) | Err(_) => {
                     closed.store(true, Ordering::Release);
                     version.fetch_add(1, Ordering::Release);
+                    on_output();
                     break;
                 }
                 Ok(n) => {
@@ -333,6 +397,7 @@ fn spawn_reader<R: Read + Send + 'static>(
                             let _ = p.write(&bytes);
                         }
                     }
+                    on_output();
                 }
             }
         }
