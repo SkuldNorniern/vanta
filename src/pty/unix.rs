@@ -384,6 +384,10 @@ impl Pty for InHousePty {
     }
 
     fn kill(&self) -> io::Result<()> {
+        // once reaped the pid may belong to someone else now: never signal it
+        if self.exit_status.lock().is_ok_and(|s| s.is_some()) {
+            return Ok(());
+        }
         // The trait contract is forceful termination, so signal `SIGKILL`
         // directly rather than the graceful-then-forced two-step a shell
         // would normally get.
@@ -423,6 +427,10 @@ unsafe impl Send for InHousePty {}
 
 impl Drop for InHousePty {
     fn drop(&mut self) {
+        if self.exit_status.lock().is_ok_and(|s| s.is_some()) {
+            // already reaped; the pid is not ours any more
+            return;
+        }
         let _ = self.kill();
         let mut status: c_int = 0;
         unsafe {
