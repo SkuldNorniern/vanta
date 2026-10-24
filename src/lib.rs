@@ -13,6 +13,7 @@ pub mod vt;
 
 use std::io::{self, Read};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -117,6 +118,19 @@ pub struct Terminal {
     /// Independent of [`Terminal::is_running`]: the read side can close
     /// slightly before or after the child process itself exits.
     closed: Arc<AtomicBool>,
+    /// Input and terminal replies for the child, written in order by one
+    /// writer thread. A child that stops reading never blocks the caller,
+    /// and never blocks the reader thread answering a query (which would
+    /// stop it draining output and deadlock both sides).
+    input: Sender<Vec<u8>>,
+}
+
+impl Drop for Terminal {
+    /// Kills the shell. Its output then ends, the reader and writer threads
+    /// finish, and the last of them drops the PTY.
+    fn drop(&mut self) {
+        let _ = self.kill();
+    }
 }
 
 impl Terminal {
@@ -159,11 +173,13 @@ impl Terminal {
         let version = Arc::new(AtomicU64::new(0));
         let closed = Arc::new(AtomicBool::new(false));
         let pty = Arc::new(Mutex::new(pty));
+        let (input, outgoing) = channel();
+        spawn_writer(outgoing, pty.clone());
         spawn_reader(
             reader,
             vt.clone(),
             version.clone(),
-            pty.clone(),
+            input.clone(),
             closed.clone(),
             on_output,
         );
@@ -172,6 +188,7 @@ impl Terminal {
             vt,
             version,
             closed,
+            input,
         })
     }
 
@@ -197,8 +214,13 @@ impl Terminal {
     /// Write raw bytes to the PTY input. Exposed alongside [`Terminal::write_str`]
     /// because terminal input (e.g. pasted data, key escape sequences) is not
     /// always valid or complete UTF-8 text.
+    ///
+    /// Queued for the writer thread; returns at once. An error means the
+    /// writer stopped, because the child's input closed.
     pub fn write_bytes(&self, bytes: &[u8]) -> io::Result<()> {
-        self.pty_io(|p| p.write(bytes))
+        self.input
+            .send(bytes.to_vec())
+            .map_err(|_| io::Error::other("pty input closed"))
     }
 
     /// Paste bytes into the terminal, wrapping them in bracketed-paste markers
@@ -210,11 +232,11 @@ impl Terminal {
             .map(|v| v.bracketed_paste_enabled())
             .unwrap_or(false);
         if bracketed {
-            self.pty_io(|p| {
-                p.write(b"\x1b[200~")?;
-                p.write(bytes)?;
-                p.write(b"\x1b[201~")
-            })
+            let mut wrapped = Vec::with_capacity(bytes.len() + 12);
+            wrapped.extend_from_slice(b"\x1b[200~");
+            wrapped.extend_from_slice(bytes);
+            wrapped.extend_from_slice(b"\x1b[201~");
+            self.write_bytes(&wrapped)
         } else {
             self.write_bytes(bytes)
         }
@@ -360,11 +382,24 @@ impl Terminal {
     }
 }
 
+/// Writes queued input to the child in order. Ends when every sender is
+/// gone or the child's input closes.
+fn spawn_writer(outgoing: Receiver<Vec<u8>>, pty: Arc<Mutex<Box<dyn pty::Pty>>>) {
+    thread::spawn(move || {
+        for bytes in outgoing {
+            let Ok(p) = pty.lock() else { return };
+            if p.write(&bytes).is_err() {
+                return;
+            }
+        }
+    });
+}
+
 fn spawn_reader<R: Read + Send + 'static>(
     mut reader: R,
     vt: Arc<Mutex<Vt>>,
     version: Arc<AtomicU64>,
-    pty: Arc<Mutex<Box<dyn pty::Pty>>>,
+    replies: Sender<Vec<u8>>,
     closed: Arc<AtomicBool>,
     on_output: impl Fn() + Send + 'static,
 ) {
@@ -393,9 +428,9 @@ fn spawn_reader<R: Read + Send + 'static>(
                         None
                     };
                     if let Some(bytes) = response {
-                        if let Ok(p) = pty.lock() {
-                            let _ = p.write(&bytes);
-                        }
+                        // queued, never written here: the reader must keep
+                        // draining output even while the child isn't reading
+                        let _ = replies.send(bytes);
                     }
                     on_output();
                 }
@@ -408,14 +443,17 @@ fn spawn_reader<R: Read + Send + 'static>(
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use std::mem;
+    use std::time::Duration;
 
     struct RecordingPty {
         writes: Arc<Mutex<Vec<u8>>>,
+        output: Vec<u8>,
     }
 
     impl pty::Pty for RecordingPty {
         fn take_reader(&mut self) -> Option<Box<dyn Read + Send>> {
-            Some(Box::new(Cursor::new(Vec::new())))
+            Some(Box::new(Cursor::new(mem::take(&mut self.output))))
         }
 
         fn write(&self, data: &[u8]) -> io::Result<()> {
@@ -444,20 +482,58 @@ mod tests {
         }
     }
 
-    fn recording_terminal() -> (Terminal, Arc<Mutex<Vec<u8>>>) {
+    fn terminal_with_output(output: &[u8]) -> (Terminal, Arc<Mutex<Vec<u8>>>) {
         let writes = Arc::new(Mutex::new(Vec::new()));
-        let pty: Box<dyn pty::Pty> = Box::new(RecordingPty {
+        let mut pty: Box<dyn pty::Pty> = Box::new(RecordingPty {
             writes: writes.clone(),
+            output: output.to_vec(),
         });
-        (
-            Terminal {
-                pty: Arc::new(Mutex::new(pty)),
-                vt: Arc::new(Mutex::new(Vt::new(10, 2))),
-                version: Arc::new(AtomicU64::new(0)),
-                closed: Arc::new(AtomicBool::new(false)),
-            },
-            writes,
-        )
+        let reader = pty.take_reader().unwrap();
+        let pty = Arc::new(Mutex::new(pty));
+        let vt = Arc::new(Mutex::new(Vt::new(10, 2)));
+        let version = Arc::new(AtomicU64::new(0));
+        let closed = Arc::new(AtomicBool::new(false));
+        let (input, outgoing) = channel();
+        spawn_writer(outgoing, pty.clone());
+        spawn_reader(
+            reader,
+            vt.clone(),
+            version.clone(),
+            input.clone(),
+            closed.clone(),
+            || {},
+        );
+        let term = Terminal {
+            pty,
+            vt,
+            version,
+            closed,
+            input,
+        };
+        (term, writes)
+    }
+
+    fn recording_terminal() -> (Terminal, Arc<Mutex<Vec<u8>>>) {
+        terminal_with_output(b"")
+    }
+
+    /// what reached the child once `len` bytes are there, or after a
+    /// second; writes go through the writer thread.
+    fn written(writes: &Mutex<Vec<u8>>, len: usize) -> Vec<u8> {
+        for _ in 0..1000 {
+            let now = writes.lock().unwrap().clone();
+            if now.len() >= len {
+                return now;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        writes.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn replies_go_out_through_the_writer() {
+        let (_term, writes) = terminal_with_output(b"\x1b[5n");
+        assert_eq!(written(&writes, 4), b"\x1b[0n");
     }
 
     #[test]
@@ -467,7 +543,7 @@ mod tests {
 
         term.paste_bytes(b"hello").unwrap();
 
-        assert_eq!(&*writes.lock().unwrap(), b"\x1b[200~hello\x1b[201~");
+        assert_eq!(written(&writes, 17), b"\x1b[200~hello\x1b[201~");
     }
 
     #[test]
@@ -476,6 +552,6 @@ mod tests {
 
         term.paste_bytes(b"hello").unwrap();
 
-        assert_eq!(&*writes.lock().unwrap(), b"hello");
+        assert_eq!(written(&writes, 5), b"hello");
     }
 }
