@@ -651,7 +651,7 @@ impl Vt {
                 }
                 'n' if self.param(0, 0) == 6 => {
                     let row = self.cy + 1;
-                    let col = self.cx + 1;
+                    let col = self.cx.min(self.cols - 1) + 1;
                     let resp = format!("\x1b[?{row};{col}R");
                     self.pending_response.extend_from_slice(resp.as_bytes());
                 }
@@ -671,7 +671,7 @@ impl Vt {
             'A' => self.cy = self.cy.saturating_sub(self.param(0, 1) as usize),
             'B' | 'e' => self.cy = (self.cy + self.param(0, 1) as usize).min(self.rows - 1),
             'C' | 'a' => self.cx = (self.cx + self.param(0, 1) as usize).min(self.cols - 1),
-            'D' => self.cx = self.cx.saturating_sub(self.param(0, 1) as usize),
+            'D' => self.cx = self.edit_col().saturating_sub(self.param(0, 1) as usize),
             'E' => {
                 self.cy = (self.cy + self.param(0, 1) as usize).min(self.rows - 1);
                 self.cx = 0;
@@ -681,7 +681,14 @@ impl Vt {
                 self.cx = 0;
             }
             'G' | '`' => self.cx = (self.param(0, 1) as usize - 1).min(self.cols - 1),
-            'd' => self.cy = (self.param(0, 1) as usize - 1).min(self.rows - 1),
+            'd' => {
+                let row = self.param(0, 1) as usize - 1;
+                self.cy = if self.origin_mode {
+                    (self.scroll_top + row).min(self.scroll_bottom)
+                } else {
+                    row.min(self.rows - 1)
+                };
+            }
             'H' | 'f' => {
                 let row = self.param(0, 1) as usize - 1;
                 self.cy = if self.origin_mode {
@@ -730,6 +737,7 @@ impl Vt {
             'X' => {
                 let n = self.param(0, 1) as usize;
                 let blank = self.pen.cell(' ');
+                self.edit_col();
                 let end = (self.cx + n).min(self.cols);
                 if self.cx < end {
                     self.break_wide_at(self.cy, self.cx);
@@ -744,7 +752,7 @@ impl Vt {
                 5 => self.pending_response.extend_from_slice(b"\x1b[0n"),
                 6 => {
                     let row = self.cy + 1;
-                    let col = self.cx + 1;
+                    let col = self.cx.min(self.cols - 1) + 1;
                     let resp = format!("\x1b[{row};{col}R");
                     self.pending_response.extend_from_slice(resp.as_bytes());
                 }
@@ -955,6 +963,43 @@ mod tests {
             CellKind::Cluster(s) => s,
             _ => panic!("expected a cluster cell"),
         }
+    }
+
+    #[test]
+    fn erase_at_the_pending_wrap_takes_the_last_column() {
+        let mut vt = Vt::new(4, 2);
+        vt.process(b"abcd\x1b[K");
+        assert_eq!(vt.render().lines().next(), Some("abc"));
+        let mut vt = Vt::new(4, 2);
+        vt.process(b"abcd\x1b[X\x1b[6n");
+        assert_eq!(vt.render().lines().next(), Some("abc"));
+        assert_eq!(vt.take_response(), Some(b"\x1b[1;4R".to_vec()));
+    }
+
+    #[test]
+    fn resize_keeps_the_normal_screen_under_alt() {
+        let mut vt = Vt::new(10, 4);
+        vt.process(b"keep\x1b[?1049hvim");
+        vt.resize(8, 4);
+        vt.process(b"\x1b[?1049l");
+        assert_eq!(vt.render().lines().next(), Some("keep"));
+    }
+
+    #[test]
+    fn shrinking_keeps_the_cursor_line() {
+        let mut vt = Vt::new(10, 6);
+        vt.process(b"1\r\n2\r\n3\r\n4\r\n$ ");
+        vt.resize(10, 2);
+        let text = vt.render();
+        assert!(text.ends_with("4\n$"), "{text:?}");
+        assert_eq!(vt.cursor(), (4, 2));
+    }
+
+    #[test]
+    fn vpa_follows_origin_mode() {
+        let mut vt = Vt::new(10, 6);
+        vt.process(b"\x1b[3;5r\x1b[?6h\x1b[2d");
+        assert_eq!(vt.cursor(), (3, 0));
     }
 
     #[test]

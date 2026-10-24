@@ -1,6 +1,8 @@
 //! Grid manipulation, character placement, and rendering — a second `impl Vt`
 //! block, split out so the parsing dispatch in `mod.rs` stays readable.
 
+use std::mem;
+
 use super::width;
 use super::{Cell, CellKind, Color, MAX_SCROLLBACK, Vt};
 
@@ -60,7 +62,38 @@ fn trim_cells(row: &[Cell]) -> Vec<Cell> {
     row[..trim_end(row)].to_vec()
 }
 
+/// `row` cut or padded to `cols` cells; a wide glyph cut in half at the
+/// new edge is blanked.
+fn fit_row(mut row: Vec<Cell>, cols: usize) -> Vec<Cell> {
+    row.resize(cols, Cell::blank());
+    if let Some(last) = row.last_mut()
+        && last.width == 2
+    {
+        *last = Cell::blank();
+    }
+    row
+}
+
+/// `rows` cut or padded to a `cols` x `count` screen.
+fn fit_screen(rows: Vec<Vec<Cell>>, cols: usize, count: usize) -> Vec<Vec<Cell>> {
+    let mut out: Vec<Vec<Cell>> = rows
+        .into_iter()
+        .take(count)
+        .map(|r| fit_row(r, cols))
+        .collect();
+    out.resize(count, vec![Cell::blank(); cols]);
+    out
+}
+
 impl Vt {
+    /// The cursor column for editing: right after the last column is
+    /// written, the cursor waits there for a wrap; erase and insert act on
+    /// the last column then, like xterm.
+    pub(super) fn edit_col(&mut self) -> usize {
+        self.cx = self.cx.min(self.cols - 1);
+        self.cx
+    }
+
     fn erase_cells(&mut self, row: usize, start: usize, end: usize, blank: &Cell) {
         let end = end.min(self.cols);
         if row >= self.rows || start >= end {
@@ -104,6 +137,7 @@ impl Vt {
 
     /// Insert `n` blank characters at the cursor column (shift right, drop overflow).
     pub(super) fn insert_chars(&mut self, n: usize) {
+        self.edit_col();
         let row = &mut self.screen[self.cy];
         let n = n.min(self.cols - self.cx);
         row[self.cx..].rotate_right(n);
@@ -115,6 +149,7 @@ impl Vt {
 
     /// Delete `n` characters at the cursor column (shift left, fill right with blank).
     pub(super) fn delete_chars(&mut self, n: usize) {
+        self.edit_col();
         let row = &mut self.screen[self.cy];
         let n = n.min(self.cols - self.cx);
         row[self.cx..].rotate_left(n);
@@ -128,7 +163,8 @@ impl Vt {
         let blank = self.pen.cell(' ');
         match mode {
             0 => {
-                self.erase_cells(self.cy, self.cx, self.cols, &blank);
+                let col = self.edit_col();
+                self.erase_cells(self.cy, col, self.cols, &blank);
                 for r in (self.cy + 1)..self.rows {
                     self.erase_cells(r, 0, self.cols, &blank);
                 }
@@ -154,7 +190,8 @@ impl Vt {
         let blank = self.pen.cell(' ');
         match mode {
             0 => {
-                self.erase_cells(self.cy, self.cx, self.cols, &blank);
+                let col = self.edit_col();
+                self.erase_cells(self.cy, col, self.cols, &blank);
             }
             1 => {
                 let end = self.cx.min(self.cols - 1);
@@ -359,21 +396,28 @@ impl Vt {
         if cols == self.cols && rows == self.rows {
             return;
         }
-        let mut next = vec![vec![Cell::blank(); cols]; rows];
-        let copy_cols = cols.min(self.cols);
-        for (dst_row, src_row) in next
-            .iter_mut()
-            .zip(self.screen.iter())
-            .take(rows.min(self.rows))
-        {
-            dst_row[..copy_cols].clone_from_slice(&src_row[..copy_cols]);
+        // fewer rows: the ones above the cursor go to scrollback, so the
+        // cursor's line (a prompt, say) stays on screen
+        let shift = (self.cy + 1).saturating_sub(rows);
+        let mut screen = mem::take(&mut self.screen);
+        let gone: Vec<Vec<Cell>> = screen.drain(..shift).collect();
+        if !self.alt_active {
+            self.scrollback.extend(gone);
+            if self.scrollback.len() > MAX_SCROLLBACK {
+                let excess = self.scrollback.len() - MAX_SCROLLBACK;
+                self.scrollback.drain(0..excess);
+            }
         }
-        self.screen = next;
-        self.alt_cells = vec![vec![Cell::blank(); cols]; rows];
+        self.screen = fit_screen(screen, cols, rows);
+        // while the alt screen is up this holds the normal one; keep it
+        self.alt_cells = fit_screen(mem::take(&mut self.alt_cells), cols, rows);
         self.cols = cols;
         self.rows = rows;
+        self.cy -= shift;
         self.cx = self.cx.min(cols - 1);
         self.cy = self.cy.min(rows - 1);
+        self.saved_cx = self.saved_cx.min(cols - 1);
+        self.saved_cy = self.saved_cy.min(rows - 1);
         self.scroll_top = 0;
         self.scroll_bottom = rows - 1;
     }
