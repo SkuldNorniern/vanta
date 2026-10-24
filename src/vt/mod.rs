@@ -20,6 +20,12 @@ use std::str;
 
 const MAX_SCROLLBACK: usize = 5000;
 const TAB: usize = 8;
+/// CSI params kept; a hostile stream can't grow the list past this.
+const MAX_PARAMS: usize = 32;
+/// Largest value one CSI param holds; bigger numbers saturate here.
+const MAX_PARAM: u32 = 65_535;
+/// Bytes of an OSC string kept; the rest is dropped until its terminator.
+const MAX_OSC: usize = 4096;
 
 /// Mouse reporting mode requested by DEC private mode sequences.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -110,6 +116,11 @@ enum State {
     OscEsc,
     /// Consume exactly one following byte (e.g. charset-select `ESC ( X`).
     SkipOne,
+    /// Inside a DCS, SOS, PM or APC string: ignored up to its terminator,
+    /// so payloads like sixel or XTGETTCAP never print as text.
+    Str,
+    /// Saw `ESC` inside such a string; `ESC \` ends it (ST).
+    StrEsc,
 }
 
 pub struct Vt {
@@ -375,7 +386,16 @@ impl Vt {
                     self.finish_osc();
                     self.state = State::OscEsc;
                 }
-                _ => self.osc_buf.push(ch),
+                // CAN and SUB cancel the string
+                '\u{18}' | '\u{1a}' => {
+                    self.osc_buf.clear();
+                    self.state = State::Ground;
+                }
+                _ => {
+                    if self.osc_buf.len() < MAX_OSC {
+                        self.osc_buf.push(ch);
+                    }
+                }
             },
             State::OscEsc => {
                 if ch == '\\' {
@@ -387,6 +407,17 @@ impl Vt {
                 }
             }
             State::SkipOne => self.state = State::Ground,
+            State::Str => match ch {
+                '\u{7}' | '\u{18}' | '\u{1a}' => self.state = State::Ground,
+                '\u{1b}' => self.state = State::StrEsc,
+                _ => {}
+            },
+            State::StrEsc => {
+                self.state = State::Ground;
+                if ch != '\\' {
+                    self.esc(ch);
+                }
+            }
         }
     }
 
@@ -426,6 +457,20 @@ impl Vt {
                 self.break_clustering();
                 self.osc_buf.clear();
                 self.state = State::Osc;
+                true
+            }
+            // DCS, SOS, PM, APC: strings to skip
+            0x90 | 0x98 | 0x9E | 0x9F => {
+                self.break_clustering();
+                self.state = State::Str;
+                true
+            }
+            // ST ends whatever string is open
+            0x9C => {
+                if self.state == State::Osc {
+                    self.finish_osc();
+                }
+                self.state = State::Ground;
                 true
             }
             _ => false,
@@ -494,6 +539,7 @@ impl Vt {
                 self.state = State::Osc;
             }
             '(' | ')' | '*' | '+' => self.state = State::SkipOne,
+            'P' | 'X' | '^' | '_' => self.state = State::Str,
             '7' => {
                 self.decsc();
                 self.state = State::Ground;
@@ -530,23 +576,39 @@ impl Vt {
         match ch {
             '0'..='9' => {
                 let d = ch as u32 - '0' as u32;
-                self.cur_param = Some(self.cur_param.unwrap_or(0) * 10 + d);
+                let value = self
+                    .cur_param
+                    .unwrap_or(0)
+                    .saturating_mul(10)
+                    .saturating_add(d)
+                    .min(MAX_PARAM);
+                self.cur_param = Some(value);
             }
             ';' | ':' => {
-                self.params.push(self.cur_param.take().unwrap_or(0));
+                let value = self.cur_param.take().unwrap_or(0);
+                if self.params.len() < MAX_PARAMS {
+                    self.params.push(value);
+                }
             }
             '?' => self.csi_private = true,
             ' ' => self.csi_intermediate_space = true,
             '>' => self.csi_greater = true,
             '!' | '=' => {}
             '\u{40}'..='\u{7e}' => {
-                if let Some(p) = self.cur_param.take() {
+                if let Some(p) = self.cur_param.take()
+                    && self.params.len() < MAX_PARAMS
+                {
                     self.params.push(p);
                 }
                 self.break_clustering();
                 self.dispatch_csi(ch);
                 self.state = State::Ground;
             }
+            // ESC aborts the sequence and starts a new one
+            '\u{1b}' => self.state = State::Esc,
+            '\u{18}' | '\u{1a}' => self.state = State::Ground,
+            // other C0 controls still act, in the middle of the sequence
+            c if (c as u32) < 0x20 => self.ground(c),
             _ => {}
         }
     }
@@ -653,13 +715,13 @@ impl Vt {
             '@' => self.insert_chars(self.param(0, 1) as usize),
             'P' => self.delete_chars(self.param(0, 1) as usize),
             'S' => {
-                let n = self.param(0, 1) as usize;
+                let n = (self.param(0, 1) as usize).min(self.rows);
                 for _ in 0..n {
                     self.scroll_up();
                 }
             }
             'T' => {
-                let n = self.param(0, 1) as usize;
+                let n = (self.param(0, 1) as usize).min(self.rows);
                 for _ in 0..n {
                     self.scroll_down();
                 }
@@ -876,6 +938,7 @@ impl Vt {
 #[cfg(test)]
 mod tests {
     use super::{Attrs, Cell, CellKind, Color, CursorStyle, MouseProtocol, MouseTracking, Vt};
+    use std::iter::repeat_n;
 
     fn render(input: &str) -> String {
         let mut vt = Vt::new(20, 5);
@@ -892,6 +955,41 @@ mod tests {
             CellKind::Cluster(s) => s,
             _ => panic!("expected a cluster cell"),
         }
+    }
+
+    #[test]
+    fn dcs_and_apc_strings_are_swallowed() {
+        assert_eq!(render("a\x1bP$q q\x1b\\b").trim_end(), "ab");
+        assert_eq!(render("a\x1b_payload\x07b").trim_end(), "ab");
+        assert_eq!(render("a\u{90}junk\u{9c}b").trim_end(), "ab");
+    }
+
+    #[test]
+    fn esc_inside_csi_starts_over() {
+        let mut vt = Vt::new(20, 2);
+        vt.process(b"\x1b[3\x1b[31mX");
+        assert_eq!(vt.render().trim_end(), "X");
+        assert_eq!(vt.screen[0][0].fg, Color::Indexed(1));
+        // a carriage return inside a sequence still acts
+        assert_eq!(render("abc\x1b[\r2Cd").trim_end(), "abd");
+    }
+
+    #[test]
+    fn hostile_params_and_strings_stay_bounded() {
+        let mut vt = Vt::new(10, 3);
+        let mut long = b"\x1b[".to_vec();
+        long.extend(repeat_n(b';', 100_000));
+        long.push(b'm');
+        vt.process(&long);
+        assert!(vt.params.capacity() <= 64);
+        vt.process(b"\x1b[99999999999999999999H\x1b[4294967295T");
+        assert_eq!(vt.cursor(), (2, 0));
+        let mut osc = b"\x1b]0;".to_vec();
+        osc.extend(repeat_n(b'x', 100_000));
+        vt.process(&osc);
+        assert!(vt.osc_buf.len() <= super::MAX_OSC);
+        vt.process(b"\x07");
+        assert_eq!(vt.title().map(str::len), Some(super::MAX_OSC - 2));
     }
 
     #[test]
