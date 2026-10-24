@@ -85,6 +85,54 @@ fn is_wide(u: u32) -> bool {
         | 0xFF00..=0xFF60 // fullwidth forms
         | 0xFFE0..=0xFFE6 // fullwidth signs
         | 0x1F300..=0x1FAFF // misc symbols/pictographs, emoji
-        | 0x2600..=0x27BF // misc symbols / dingbats (approximate: many common emoji live here)
+        // only the symbols drawn as emoji by default are wide; the rest of
+        // misc symbols and dingbats (check marks, arrows, stars) are one cell
+        | 0x231A..=0x231B
+        | 0x23E9..=0x23EC
+        | 0x23F0
+        | 0x23F3
+        | 0x25FD..=0x25FE
+        | 0x2614..=0x2615
+        | 0x2648..=0x2653
+        | 0x267F
+        | 0x2693
+        | 0x26A1
+        | 0x26AA..=0x26AB
+        | 0x26BD..=0x26BE
+        | 0x26C4..=0x26C5
+        | 0x26CE
+        | 0x26D4
+        | 0x26EA
+        | 0x26F2..=0x26F3
+        | 0x26F5
+        | 0x26FA
+        | 0x26FD
+        | 0x2705
+        | 0x270A..=0x270B
+        | 0x2728
+        | 0x274C
+        | 0x274E
+        | 0x2753..=0x2755
+        | 0x2757
+        | 0x2795..=0x2797
+        | 0x27B0
+        | 0x27BF
+        | 0x2B1B..=0x2B1C
+        | 0x2B50
+        | 0x2B55
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::char_width;
+
+    #[test]
+    fn dingbats_are_narrow_unless_drawn_as_emoji() {
+        assert_eq!(char_width('✓'), 1);
+        assert_eq!(char_width('★'), 1);
+        assert_eq!(char_width('☕'), 2);
+        assert_eq!(char_width('✅'), 2);
+        assert_eq!(char_width('가'), 2);
+    }
 }
