@@ -204,6 +204,11 @@ pub struct Vt {
 
     // ── DEC mode 2004: bracketed paste ────────────────────────────────────
     bracketed_paste: bool,
+
+    /// Lines dropped off the top of scrollback, ever: at the cap, or cleared
+    /// by `CSI 3 J`. A view scrolled back subtracts the growth to stay on
+    /// the same lines, since line numbers shift down by that much.
+    dropped: u64,
 }
 
 impl Vt {
@@ -249,6 +254,7 @@ impl Vt {
             mouse_tracking: MouseTracking::Off,
             mouse_protocol: MouseProtocol::X10,
             bracketed_paste: false,
+            dropped: 0,
         }
     }
 
@@ -299,6 +305,11 @@ impl Vt {
     /// Whether the alternate screen is currently active (DECSET 47 / 1049).
     pub fn on_alt_screen(&self) -> bool {
         self.alt_active
+    }
+
+    /// Lines dropped off the top of scrollback so far.
+    pub fn dropped(&self) -> u64 {
+        self.dropped
     }
 
     /// Whether bracketed paste mode is enabled (DECSET 2004).
@@ -963,6 +974,17 @@ mod tests {
             CellKind::Cluster(s) => s,
             _ => panic!("expected a cluster cell"),
         }
+    }
+
+    #[test]
+    fn dropped_counts_lines_off_the_top() {
+        let mut vt = Vt::new(4, 2);
+        for _ in 0..super::MAX_SCROLLBACK + 10 {
+            vt.process(b"x\r\n");
+        }
+        assert_eq!(vt.dropped(), 9);
+        vt.process(b"\x1b[3J");
+        assert_eq!(vt.dropped(), 9 + super::MAX_SCROLLBACK as u64);
     }
 
     #[test]

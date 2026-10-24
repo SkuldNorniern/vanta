@@ -57,6 +57,8 @@ pub struct Snapshot {
     pub mouse_tracking: MouseTracking,
     /// Mouse coordinate protocol requested by the child.
     pub mouse_protocol: MouseProtocol,
+    /// Lines dropped off the top of scrollback so far; see [`Vt::dropped`].
+    pub dropped: u64,
 }
 
 impl Snapshot {
@@ -105,6 +107,8 @@ pub struct Window {
     pub application_cursor_keys: bool,
     /// Whether the PTY output stream has reached EOF.
     pub closed: bool,
+    /// Lines dropped off the top of scrollback so far; see [`Vt::dropped`].
+    pub dropped: u64,
 }
 
 /// A running shell on a PTY, with its output rendered through a VT grid.
@@ -286,6 +290,7 @@ impl Terminal {
                 focus_tracking: v.focus_tracking_enabled(),
                 mouse_tracking: v.mouse_tracking(),
                 mouse_protocol: v.mouse_protocol(),
+                dropped: v.dropped(),
             })
             .unwrap_or_else(|_| Snapshot {
                 screen: Vec::new(),
@@ -303,6 +308,7 @@ impl Terminal {
                 focus_tracking: false,
                 mouse_tracking: MouseTracking::Off,
                 mouse_protocol: MouseProtocol::X10,
+                dropped: 0,
             })
     }
 
@@ -324,6 +330,7 @@ impl Terminal {
                 bracketed_paste: v.bracketed_paste_enabled(),
                 application_cursor_keys: v.application_cursor_keys(),
                 closed,
+                dropped: v.dropped(),
             })
             .unwrap_or(Window {
                 lines: 0,
@@ -335,6 +342,7 @@ impl Terminal {
                 bracketed_paste: false,
                 application_cursor_keys: false,
                 closed,
+                dropped: 0,
             })
     }
 

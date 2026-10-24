@@ -180,6 +180,7 @@ impl Vt {
                     self.erase_cells(r, 0, self.cols, &blank);
                 }
                 if mode == 3 {
+                    self.dropped += self.scrollback.len() as u64;
                     self.scrollback.clear();
                 }
             }
@@ -375,6 +376,7 @@ impl Vt {
             if self.scrollback.len() > MAX_SCROLLBACK {
                 let excess = self.scrollback.len() - MAX_SCROLLBACK;
                 self.scrollback.drain(0..excess);
+                self.dropped += excess as u64;
             }
         }
         self.screen
@@ -406,6 +408,7 @@ impl Vt {
             if self.scrollback.len() > MAX_SCROLLBACK {
                 let excess = self.scrollback.len() - MAX_SCROLLBACK;
                 self.scrollback.drain(0..excess);
+                self.dropped += excess as u64;
             }
         }
         self.screen = fit_screen(screen, cols, rows);
