@@ -20,6 +20,7 @@ pub use osc::{Event, Palette, Rgb};
 
 use std::mem;
 use std::str;
+use std::time::{Duration, Instant};
 
 const MAX_SCROLLBACK: usize = 5000;
 const TAB: usize = 8;
@@ -29,6 +30,9 @@ const MAX_PARAMS: usize = 32;
 const MAX_PARAM: u32 = 65_535;
 /// Bytes of an OSC string kept; the rest is dropped until its terminator.
 const MAX_OSC: usize = 4096;
+/// Longest a synchronized update (mode 2026) holds the screen back; an app
+/// that never ends one can't freeze the view.
+const SYNC_TIMEOUT: Duration = Duration::from_millis(150);
 /// Titles `CSI 22 t` keeps on its stack.
 const MAX_TITLES: usize = 16;
 
@@ -270,6 +274,8 @@ pub struct Vt {
 
     // ── DEC mode 2004: bracketed paste ────────────────────────────────────
     bracketed_paste: bool,
+    /// When mode 2026 began a synchronized update, while one is open.
+    sync_since: Option<Instant>,
 
     /// Lines dropped off the top of scrollback, ever: at the cap, or cleared
     /// by `CSI 3 J`. A view scrolled back subtracts the growth to stay on
@@ -334,6 +340,7 @@ impl Vt {
             mouse_tracking: MouseTracking::Off,
             mouse_protocol: MouseProtocol::X10,
             bracketed_paste: false,
+            sync_since: None,
             dropped: 0,
         }
     }
@@ -385,6 +392,17 @@ impl Vt {
     /// Whether the alternate screen is currently active (DECSET 47 / 1049).
     pub fn on_alt_screen(&self) -> bool {
         self.alt_active
+    }
+
+    /// Whether an app is mid synchronized update (mode 2026): the screen is
+    /// half drawn and better not shown yet. False once it ran too long.
+    pub fn sync_held(&self) -> bool {
+        self.sync_deadline().is_some_and(|end| Instant::now() < end)
+    }
+
+    /// When an open synchronized update stops holding the screen back.
+    pub fn sync_deadline(&self) -> Option<Instant> {
+        self.sync_since.map(|start| start + SYNC_TIMEOUT)
     }
 
     /// Lines dropped off the top of scrollback so far.
@@ -1060,6 +1078,7 @@ impl Vt {
             1006 => self.mouse_protocol == MouseProtocol::Sgr,
             1015 => self.mouse_protocol == MouseProtocol::Urxvt,
             2004 => self.bracketed_paste,
+            2026 => self.sync_since.is_some(),
             _ => return 0,
         };
         if on { 1 } else { 2 }
@@ -1092,6 +1111,9 @@ impl Vt {
             1006 => self.mouse_protocol = MouseProtocol::Sgr,
             1015 => self.mouse_protocol = MouseProtocol::Urxvt,
             2004 => self.bracketed_paste = true,
+            2026 => {
+                self.sync_since.get_or_insert_with(Instant::now);
+            }
             _ => {}
         }
     }
@@ -1129,6 +1151,7 @@ impl Vt {
             1004 => self.focus_tracking = false,
             1005 | 1006 | 1015 => self.mouse_protocol = MouseProtocol::X10,
             2004 => self.bracketed_paste = false,
+            2026 => self.sync_since = None,
             _ => {}
         }
     }
@@ -1298,6 +1321,7 @@ impl Vt {
 mod tests {
     use super::{Attrs, Cell, CellKind, Color, CursorStyle, MouseProtocol, MouseTracking, Vt};
     use std::iter::repeat_n;
+    use std::time::Instant;
 
     fn render(input: &str) -> String {
         let mut vt = Vt::new(20, 5);
@@ -2146,5 +2170,18 @@ mod tests {
         assert_eq!(vt.title(), Some("vim"));
         vt.process(b"\x1b[23t");
         assert_eq!(vt.title(), Some("shell"));
+    }
+
+    #[test]
+    fn synchronized_updates_hold_until_done_or_too_long() {
+        let mut vt = Vt::new(10, 2);
+        assert!(!vt.sync_held());
+        vt.process(b"\x1b[?2026h\x1b[?2026$p");
+        assert!(vt.sync_held());
+        assert_eq!(vt.take_response(), Some(b"\x1b[?2026;1$y".to_vec()));
+        vt.process(b"\x1b[?2026l");
+        assert!(!vt.sync_held());
+        vt.sync_since = Some(Instant::now() - super::SYNC_TIMEOUT);
+        assert!(!vt.sync_held(), "timed out");
     }
 }

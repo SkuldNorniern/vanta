@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Instant;
 
 use vt::Vt;
 pub use vt::{
@@ -130,6 +131,9 @@ pub struct Terminal {
     /// Independent of [`Terminal::is_running`]: the read side can close
     /// slightly before or after the child process itself exits.
     closed: Arc<AtomicBool>,
+    /// Output came in during a synchronized update and `version` wasn't
+    /// bumped for it yet; [`Terminal::version`] bumps it once the update ends.
+    held: Arc<AtomicBool>,
     /// Input and terminal replies for the child, written in order by one
     /// writer thread. A child that stops reading never blocks the caller,
     /// and never blocks the reader thread answering a query (which would
@@ -184,6 +188,7 @@ impl Terminal {
         let vt = Arc::new(Mutex::new(vt_inner));
         let version = Arc::new(AtomicU64::new(0));
         let closed = Arc::new(AtomicBool::new(false));
+        let held = Arc::new(AtomicBool::new(false));
         let pty: Arc<dyn pty::Pty> = Arc::from(pty);
         let (input, outgoing) = channel();
         spawn_writer(outgoing, pty.clone());
@@ -193,6 +198,7 @@ impl Terminal {
             version.clone(),
             input.clone(),
             closed.clone(),
+            held.clone(),
             on_output,
         );
         Ok(Self {
@@ -200,6 +206,7 @@ impl Terminal {
             vt,
             version,
             closed,
+            held,
             input,
         })
     }
@@ -207,7 +214,24 @@ impl Terminal {
     /// A monotonically increasing counter of processed output chunks. Unchanged
     /// since a previous read means there is nothing new to render.
     pub fn version(&self) -> u64 {
+        if self.held.load(Ordering::Acquire)
+            && let Ok(v) = self.vt.lock()
+            && !v.sync_held()
+            && self.held.swap(false, Ordering::AcqRel)
+        {
+            self.version.fetch_add(1, Ordering::Release);
+        }
         self.version.load(Ordering::Acquire)
+    }
+
+    /// While an app holds the screen back for a synchronized update, when
+    /// that hold runs out. A host waiting on output should wake by then and
+    /// call [`Self::version`] again, since no more output may come.
+    pub fn sync_deadline(&self) -> Option<Instant> {
+        if !self.held.load(Ordering::Acquire) {
+            return None;
+        }
+        self.vt.lock().ok().and_then(|v| v.sync_deadline())
     }
 
     /// Whether the PTY output stream has reached EOF or a read error. This is
@@ -454,6 +478,7 @@ fn spawn_reader<R: Read + Send + 'static>(
     version: Arc<AtomicU64>,
     replies: Sender<Vec<u8>>,
     closed: Arc<AtomicBool>,
+    held: Arc<AtomicBool>,
     on_output: impl Fn() + Send + 'static,
 ) {
     thread::spawn(move || {
@@ -475,7 +500,13 @@ fn spawn_reader<R: Read + Send + 'static>(
                         // this update with the old version, or after it with
                         // the new one — never a stale version paired with
                         // fresh cells.
-                        version.fetch_add(1, Ordering::Release);
+                        if v.sync_held() {
+                            // a half drawn frame: shown once the app is done
+                            held.store(true, Ordering::Release);
+                        } else {
+                            held.store(false, Ordering::Release);
+                            version.fetch_add(1, Ordering::Release);
+                        }
                         response
                     } else {
                         None
@@ -546,6 +577,7 @@ mod tests {
         let vt = Arc::new(Mutex::new(Vt::new(10, 2)));
         let version = Arc::new(AtomicU64::new(0));
         let closed = Arc::new(AtomicBool::new(false));
+        let held = Arc::new(AtomicBool::new(false));
         let (input, outgoing) = channel();
         spawn_writer(outgoing, pty.clone());
         spawn_reader(
@@ -554,6 +586,7 @@ mod tests {
             version.clone(),
             input.clone(),
             closed.clone(),
+            held.clone(),
             || {},
         );
         let term = Terminal {
@@ -561,6 +594,7 @@ mod tests {
             vt,
             version,
             closed,
+            held,
             input,
         };
         (term, writes)
@@ -606,5 +640,21 @@ mod tests {
         term.paste_bytes(b"hello").unwrap();
 
         assert_eq!(written(&writes, 5), b"hello");
+    }
+
+    #[test]
+    fn a_synchronized_frame_shows_once_it_ends() {
+        let (term, _) = terminal_with_output(b"\x1b[?2026hhalf");
+        for _ in 0..1000 {
+            if term.held.load(Ordering::Acquire) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        let held_at = term.version();
+        assert!(term.sync_deadline().is_some());
+        term.vt.lock().unwrap().process(b"\x1b[?2026l");
+        assert!(term.version() > held_at, "the end of the update shows it");
+        assert_eq!(term.sync_deadline(), None);
     }
 }
