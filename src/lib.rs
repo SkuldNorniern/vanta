@@ -98,8 +98,13 @@ impl Snapshot {
 pub struct Window {
     /// Lines in scrollback plus screen.
     pub lines: usize,
+    /// The line `rows` starts at.
+    pub first: usize,
     /// The requested lines, trailing blank cells trimmed.
     pub rows: Vec<Vec<Cell>>,
+    /// For each of `rows`, whether it runs on into the next (it reached the
+    /// edge and wrapped), so copied text can join them back.
+    pub wrapped: Vec<bool>,
     /// The cursor's absolute `(line, col)`, same numbering as `lines`.
     pub cursor: (usize, usize),
     /// The [`Terminal::version`] this was read at.
@@ -348,13 +353,30 @@ impl Terminal {
     /// under one lock. Unlike [`Self::snapshot`] it copies only those lines,
     /// not the whole scrollback.
     pub fn window(&self, first: usize, count: usize) -> Window {
+        self.window_at(count, |_| first)
+    }
+
+    /// `count` lines ending `back` lines above the bottom: what a view
+    /// scrolled back by `back` shows. Counted under the same lock as the
+    /// lines, so output arriving meanwhile can't shift it.
+    pub fn view(&self, back: usize, count: usize) -> Window {
+        self.window_at(count, |lines| lines.saturating_sub(count + back))
+    }
+
+    fn window_at(&self, count: usize, first: impl FnOnce(usize) -> usize) -> Window {
         let closed = self.closed.load(Ordering::Acquire);
         let version = self.version.load(Ordering::Acquire);
         self.vt
             .lock()
-            .map(|v| Window {
+            .map(|v| {
+                let first = first(v.line_count());
+                (v, first)
+            })
+            .map(|(v, first)| Window {
                 lines: v.line_count(),
+                first,
                 rows: v.cells_window(first, count),
+                wrapped: v.wraps_window(first, count),
                 cursor: v.cursor(),
                 version,
                 cursor_visible: v.cursor_visible(),
@@ -371,7 +393,9 @@ impl Terminal {
             })
             .unwrap_or(Window {
                 lines: 0,
+                first: 0,
                 rows: Vec::new(),
+                wrapped: Vec::new(),
                 cursor: (0, 0),
                 version,
                 cursor_visible: true,
@@ -656,5 +680,22 @@ mod tests {
         term.vt.lock().unwrap().process(b"\x1b[?2026l");
         assert!(term.version() > held_at, "the end of the update shows it");
         assert_eq!(term.sync_deadline(), None);
+    }
+
+    #[test]
+    fn a_view_counts_back_from_the_bottom() {
+        let (term, _) = recording_terminal();
+        term.vt
+            .lock()
+            .unwrap()
+            .process(b"1\r\n2\r\n3\r\n4\r\n0123456789ab");
+        // 10 x 2: lines are 1 2 3 4 0123456789 ab
+        let view = term.view(0, 2);
+        assert_eq!((view.lines, view.first), (6, 4));
+        assert_eq!(view.wrapped, [true, false]);
+        let back = term.view(3, 2);
+        assert_eq!(back.first, 1);
+        assert_eq!(back.rows[0][0].ch(), '2');
+        assert_eq!(term.view(99, 2).first, 0, "held at the top");
     }
 }

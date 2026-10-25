@@ -521,6 +521,18 @@ impl Vt {
     /// Up to `count` lines from `first`, counted over scrollback then screen
     /// (the order of [`Self::cursor`]), trailing blank cells trimmed. Lets a
     /// renderer copy only the lines it shows.
+    /// For the same lines as [`Self::cells_window`], whether each runs on
+    /// into the next because it reached the edge.
+    pub fn wraps_window(&self, first: usize, count: usize) -> Vec<bool> {
+        self.scrollback
+            .iter()
+            .chain(&self.screen)
+            .skip(first)
+            .take(count)
+            .map(|row| row.wrapped)
+            .collect()
+    }
+
     pub fn cells_window(&self, first: usize, count: usize) -> Vec<Vec<Cell>> {
         self.scrollback
             .iter()
