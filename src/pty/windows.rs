@@ -637,6 +637,10 @@ impl Pty for InHousePty {
 }
 
 unsafe impl Send for InHousePty {}
+// SAFETY: the process handle is only passed to thread-safe kernel calls
+// (`WaitForSingleObject`, `GetExitCodeProcess`, `TerminateProcess`); the
+// pipes and the pseudo console sit behind mutexes.
+unsafe impl Sync for InHousePty {}
 
 impl Drop for InHousePty {
     fn drop(&mut self) {

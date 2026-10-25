@@ -23,7 +23,11 @@ pub enum ExitStatus {
 
 /// A spawned pseudo-terminal: a reader for output, a writer for input, plus
 /// resize and lifecycle. Concrete backends own the child process.
-pub trait Pty: Send {
+///
+/// `Sync`: every `&self` method is safe from any thread at once, so a write
+/// blocked on a child that stopped reading never holds up a resize or a
+/// status check from the UI thread.
+pub trait Pty: Send + Sync {
     /// Take the output reader (once); `None` afterwards.
     fn take_reader(&mut self) -> Option<Box<dyn Read + Send>>;
     /// Write bytes to the PTY input.

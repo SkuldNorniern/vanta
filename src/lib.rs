@@ -113,7 +113,7 @@ pub struct Window {
 
 /// A running shell on a PTY, with its output rendered through a VT grid.
 pub struct Terminal {
-    pty: Arc<Mutex<Box<dyn pty::Pty>>>,
+    pty: Arc<dyn pty::Pty>,
     vt: Arc<Mutex<Vt>>,
     /// Bumped by the reader thread on every processed chunk; lets callers skip
     /// re-rendering the whole grid when nothing new has arrived.
@@ -176,7 +176,7 @@ impl Terminal {
         let vt = Arc::new(Mutex::new(vt_inner));
         let version = Arc::new(AtomicU64::new(0));
         let closed = Arc::new(AtomicBool::new(false));
-        let pty = Arc::new(Mutex::new(pty));
+        let pty: Arc<dyn pty::Pty> = Arc::from(pty);
         let (input, outgoing) = channel();
         spawn_writer(outgoing, pty.clone());
         spawn_reader(
@@ -378,25 +378,21 @@ impl Terminal {
         self.pty_io(|p| p.close_input())
     }
 
-    /// Run `f` with the locked PTY, or `None` if the lock is poisoned.
     fn with_pty<R>(&self, f: impl FnOnce(&dyn pty::Pty) -> R) -> Option<R> {
-        self.pty.lock().ok().map(|p| f(&**p))
+        Some(f(&*self.pty))
     }
 
-    /// Run `f` with the locked PTY, surfacing lock poisoning as an `io::Error`.
     fn pty_io<R>(&self, f: impl FnOnce(&dyn pty::Pty) -> io::Result<R>) -> io::Result<R> {
-        self.with_pty(f)
-            .unwrap_or_else(|| Err(io::Error::other("pty mutex poisoned")))
+        f(&*self.pty)
     }
 }
 
 /// Writes queued input to the child in order. Ends when every sender is
 /// gone or the child's input closes.
-fn spawn_writer(outgoing: Receiver<Vec<u8>>, pty: Arc<Mutex<Box<dyn pty::Pty>>>) {
+fn spawn_writer(outgoing: Receiver<Vec<u8>>, pty: Arc<dyn pty::Pty>) {
     thread::spawn(move || {
         for bytes in outgoing {
-            let Ok(p) = pty.lock() else { return };
-            if p.write(&bytes).is_err() {
+            if pty.write(&bytes).is_err() {
                 return;
             }
         }
@@ -497,7 +493,7 @@ mod tests {
             output: output.to_vec(),
         });
         let reader = pty.take_reader().unwrap();
-        let pty = Arc::new(Mutex::new(pty));
+        let pty: Arc<dyn pty::Pty> = Arc::from(pty);
         let vt = Arc::new(Mutex::new(Vt::new(10, 2)));
         let version = Arc::new(AtomicU64::new(0));
         let closed = Arc::new(AtomicBool::new(false));

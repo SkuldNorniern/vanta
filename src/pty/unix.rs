@@ -424,6 +424,9 @@ impl Pty for InHousePty {
 }
 
 unsafe impl Send for InHousePty {}
+// SAFETY: `master` is a plain fd that `write`, `ioctl` and `kill` use through
+// thread-safe syscalls; the rest of the state sits behind mutexes.
+unsafe impl Sync for InHousePty {}
 
 impl Drop for InHousePty {
     fn drop(&mut self) {
