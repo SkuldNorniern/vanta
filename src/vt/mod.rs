@@ -1186,18 +1186,26 @@ impl Vt {
 
     fn sgr(&mut self) {
         if self.params.is_empty() {
-            self.pen.reset();
+            self.reset_pen();
             return;
         }
+        let params = mem::take(&mut self.params);
         let mut i = 0;
-        while i < self.params.len() {
-            let p = self.params[i];
+        while i < params.len() {
+            let p = params[i];
+            // the sub-params after this one: `4:3`, `38:2::r:g:b`
+            let mut end = i + 1;
+            while end < params.len() && self.subs.get(end) == Some(&true) {
+                end += 1;
+            }
+            let subs = &params[i + 1..end];
             match p {
-                0 => self.pen.reset(),
+                0 => self.reset_pen(),
                 1 => self.pen.attrs.set(Attrs::BOLD, true),
                 2 => self.pen.attrs.set(Attrs::DIM, true),
                 3 => self.pen.attrs.set(Attrs::ITALIC, true),
-                4 => self.pen.attrs.set(Attrs::UNDERLINE, true),
+                4 => self.set_underline(subs.first().copied().unwrap_or(1)),
+                21 => self.set_underline(2),
                 5 | 6 => self.pen.attrs.set(Attrs::BLINK, true),
                 7 => self.pen.attrs.set(Attrs::INVERSE, true),
                 8 => self.pen.attrs.set(Attrs::HIDDEN, true),
@@ -1207,7 +1215,7 @@ impl Vt {
                     self.pen.attrs.set(Attrs::DIM, false);
                 }
                 23 => self.pen.attrs.set(Attrs::ITALIC, false),
-                24 => self.pen.attrs.set(Attrs::UNDERLINE, false),
+                24 => self.set_underline(0),
                 25 => self.pen.attrs.set(Attrs::BLINK, false),
                 27 => self.pen.attrs.set(Attrs::INVERSE, false),
                 28 => self.pen.attrs.set(Attrs::HIDDEN, false),
@@ -1220,28 +1228,63 @@ impl Vt {
                 40..=47 => self.pen.bg = Color::Indexed((p - 40) as u8),
                 100..=107 => self.pen.bg = Color::Indexed((p - 100 + 8) as u8),
                 49 => self.pen.bg = Color::Default,
-                38 => {
-                    if let Some((c, used)) = grid::parse_extended(&self.params[i + 1..]) {
-                        self.pen.fg = c;
-                        i += used;
-                    }
-                }
-                58 => {
-                    if let Some((c, used)) = grid::parse_extended(&self.params[i + 1..]) {
-                        self.pen.underline_color = c;
-                        i += used;
-                    }
-                }
                 59 => self.pen.underline_color = Color::Default,
-                48 => {
-                    if let Some((c, used)) = grid::parse_extended(&self.params[i + 1..]) {
-                        self.pen.bg = c;
-                        i += used;
+                38 | 48 | 58 => {
+                    // colon form carries its colour in the sub-params; the
+                    // semicolon form takes the plain params after it
+                    let parsed = if subs.is_empty() {
+                        grid::parse_extended(&params[end..]).map(|(c, used)| {
+                            end += used;
+                            c
+                        })
+                    } else {
+                        grid::parse_extended_colon(subs)
+                    };
+                    if let Some(c) = parsed {
+                        match p {
+                            38 => self.pen.fg = c,
+                            48 => self.pen.bg = c,
+                            _ => self.pen.underline_color = c,
+                        }
                     }
                 }
                 _ => {}
             }
-            i += 1;
+            i = end;
+        }
+        self.params = params;
+    }
+
+    /// SGR 0: the pen back to plain. An OSC 8 link stays open; only
+    /// another OSC 8 ends it.
+    fn reset_pen(&mut self) {
+        let link = self.pen.hyperlink.take();
+        self.pen.reset();
+        self.pen.hyperlink = link;
+    }
+
+    /// `4:n`: 0 none, 1 single, 2 double, 3 curly, 4 dotted, 5 dashed.
+    fn set_underline(&mut self, style: u32) {
+        for flag in [
+            Attrs::UNDERLINE,
+            Attrs::DOUBLE_UNDERLINE,
+            Attrs::CURLY_UNDERLINE,
+            Attrs::DOTTED_UNDERLINE,
+            Attrs::DASHED_UNDERLINE,
+        ] {
+            self.pen.attrs.set(flag, false);
+        }
+        let extra = match style {
+            0 => return,
+            2 => Some(Attrs::DOUBLE_UNDERLINE),
+            3 => Some(Attrs::CURLY_UNDERLINE),
+            4 => Some(Attrs::DOTTED_UNDERLINE),
+            5 => Some(Attrs::DASHED_UNDERLINE),
+            _ => None,
+        };
+        self.pen.attrs.set(Attrs::UNDERLINE, true);
+        if let Some(flag) = extra {
+            self.pen.attrs.set(flag, true);
         }
     }
 }
@@ -1425,6 +1468,45 @@ mod tests {
         let cells = vt.render_cells();
         assert_eq!(cells[0][0].fg, Color::Rgb(10, 20, 30));
         assert_eq!(cells[0][1].bg, Color::Rgb(40, 50, 60));
+    }
+
+    #[test]
+    fn sgr_underline_styles_use_sub_params() {
+        let mut vt = Vt::new(20, 2);
+        // nvim's undercurl must not turn on italic, and 4:0 must not reset colours
+        vt.process(b"\x1b[31;4:3mA\x1b[4:0mB\x1b[21mC\x1b[4mD\x1b[24mE");
+        let cells = vt.render_cells();
+        let a = cells[0][0].attrs;
+        assert!(a.contains(Attrs::UNDERLINE) && a.contains(Attrs::CURLY_UNDERLINE));
+        assert!(!a.contains(Attrs::ITALIC));
+        assert!(!cells[0][1].attrs.contains(Attrs::UNDERLINE));
+        assert_eq!(cells[0][1].fg, Color::Indexed(1));
+        assert!(cells[0][2].attrs.contains(Attrs::DOUBLE_UNDERLINE));
+        assert!(cells[0][3].attrs.contains(Attrs::UNDERLINE));
+        assert!(!cells[0][3].attrs.contains(Attrs::DOUBLE_UNDERLINE));
+        assert_eq!(cells[0][4].attrs, Attrs::default());
+    }
+
+    #[test]
+    fn sgr_colours_take_every_form() {
+        let mut vt = Vt::new(20, 2);
+        // red 0 in the semicolon form, then more params after it
+        vt.process(b"\x1b[38;2;0;128;0;1mA\x1b[0;38:5:300mB\x1b[58:2:1:2:3;4mC");
+        let cells = vt.render_cells();
+        assert_eq!(cells[0][0].fg, Color::Rgb(0, 128, 0));
+        assert!(cells[0][0].attrs.contains(Attrs::BOLD));
+        assert_eq!(cells[0][1].fg, Color::Default, "300 is no palette slot");
+        assert_eq!(cells[0][2].underline_color, Color::Rgb(1, 2, 3));
+        assert!(cells[0][2].attrs.contains(Attrs::UNDERLINE));
+    }
+
+    #[test]
+    fn sgr_reset_keeps_the_link_open() {
+        let mut vt = Vt::new(20, 2);
+        vt.process(b"\x1b]8;;https://x.dev\x1b\\\x1b[1ma\x1b[0mb\x1b]8;;\x1b\\c");
+        let cells = vt.render_cells();
+        assert_eq!(cells[0][1].hyperlink.as_deref(), Some("https://x.dev"));
+        assert_eq!(cells[0][2].hyperlink, None);
     }
 
     #[test]

@@ -23,6 +23,11 @@ impl Attrs {
     pub const HIDDEN: Attrs = Attrs(1 << 6);
     pub const STRIKE: Attrs = Attrs(1 << 7);
     pub const OVERLINE: Attrs = Attrs(1 << 8);
+    /// underline shapes from `4:2` to `4:5`; `UNDERLINE` is set with each.
+    pub const DOUBLE_UNDERLINE: Attrs = Attrs(1 << 9);
+    pub const CURLY_UNDERLINE: Attrs = Attrs(1 << 10);
+    pub const DOTTED_UNDERLINE: Attrs = Attrs(1 << 11);
+    pub const DASHED_UNDERLINE: Attrs = Attrs(1 << 12);
 
     pub fn contains(self, flag: Attrs) -> bool {
         self.0 & flag.0 == flag.0

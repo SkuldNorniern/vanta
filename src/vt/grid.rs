@@ -12,21 +12,32 @@ pub(super) fn is_regional_indicator(c: char) -> bool {
     matches!(c as u32, 0x1F1E6..=0x1F1FF)
 }
 
-/// Parse the tail of a `38`/`48`/`58` SGR: `5;<idx>` (256-colour) or
-/// `2;<r>;<g>;<b>` (truecolour). Returns the colour and how many params were
-/// consumed.
+/// The colour after a `38` / `48` / `58` in the semicolon form:
+/// `5;idx` or `2;r;g;b`. Also how many params it took.
 pub(super) fn parse_extended(rest: &[u32]) -> Option<(Color, usize)> {
     match rest.first().copied() {
-        Some(5) => rest.get(1).map(|&idx| (Color::Indexed(idx as u8), 2)),
+        Some(5) => Some((Color::Indexed(u8::try_from(*rest.get(1)?).ok()?), 2)),
         Some(2) => {
-            let offset = usize::from(rest.len() >= 5 && rest.get(1) == Some(&0));
-            let r = *rest.get(1 + offset)? as u8;
-            let g = *rest.get(2 + offset)? as u8;
-            let b = *rest.get(3 + offset)? as u8;
-            Some((Color::Rgb(r, g, b), 4 + offset))
+            let rgb = rest.get(1..4)?;
+            Some((rgb_of(rgb), 4))
         }
         _ => None,
     }
+}
+
+/// The same in the colon form: `5:idx`, `2:r:g:b`, or `2:space:r:g:b`.
+pub(super) fn parse_extended_colon(subs: &[u32]) -> Option<Color> {
+    match subs.first().copied() {
+        Some(5) => Some(Color::Indexed(u8::try_from(*subs.get(1)?).ok()?)),
+        Some(2) if subs.len() >= 5 => Some(rgb_of(&subs[2..5])),
+        Some(2) if subs.len() == 4 => Some(rgb_of(&subs[1..4])),
+        _ => None,
+    }
+}
+
+fn rgb_of(rgb: &[u32]) -> Color {
+    let c = |v: u32| v.min(255) as u8;
+    Color::Rgb(c(rgb[0]), c(rgb[1]), c(rgb[2]))
 }
 
 fn is_blank(cell: &Cell) -> bool {
