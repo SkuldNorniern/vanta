@@ -298,7 +298,9 @@ impl Vt {
     }
 
     pub(super) fn merge_into_cluster(&mut self, row: usize, col: usize, ch: char) {
-        let cell = &mut self.screen[row][col];
+        let Some(cell) = self.screen.get_mut(row).and_then(|r| r.get_mut(col)) else {
+            return;
+        };
         match &cell.kind {
             CellKind::Char(c) => {
                 let mut s = String::with_capacity(c.len_utf8() + ch.len_utf8());
@@ -331,6 +333,9 @@ impl Vt {
         } else {
             w
         };
+        if self.insert_mode {
+            self.insert_chars(w as usize);
+        }
         self.break_wide_at(self.cy, self.cx);
         if w == 2 && self.cx + 1 < self.cols {
             self.break_wide_at(self.cy, self.cx + 1);
@@ -397,6 +402,14 @@ impl Vt {
         let rows = rows.max(1);
         if cols == self.cols && rows == self.rows {
             return;
+        }
+        // a half-joined emoji or flag points at a cell that may be gone
+        self.break_clustering();
+        if cols != self.cols {
+            let mut tabs = super::default_tabs(cols);
+            let kept = cols.min(self.cols);
+            tabs[..kept].copy_from_slice(&self.tabs[..kept]);
+            self.tabs = tabs;
         }
         // fewer rows: the ones above the cursor go to scrollback, so the
         // cursor's line (a prompt, say) stays on screen

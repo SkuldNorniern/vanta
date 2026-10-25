@@ -26,6 +26,33 @@ const MAX_PARAMS: usize = 32;
 const MAX_PARAM: u32 = 65_535;
 /// Bytes of an OSC string kept; the rest is dropped until its terminator.
 const MAX_OSC: usize = 4096;
+/// Titles `CSI 22 t` keeps on its stack.
+const MAX_TITLES: usize = 16;
+
+/// What a G0 / G1 slot maps bytes to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum Charset {
+    #[default]
+    Ascii,
+    /// DEC special graphics (`ESC ( 0`): `q` is `─`, `x` is `│` and so on.
+    /// ncurses and tmux draw boxes with it when the locale isn't UTF-8.
+    DecGraphics,
+}
+
+/// DEC special graphics for `_` through `~`.
+const DEC_GRAPHICS: [char; 32] = [
+    ' ', '◆', '▒', '␉', '␌', '␍', '␊', '°', '±', '␤', '␋', '┘', '┐', '┌', '└', '┼', '⎺', '⎻', '─',
+    '⎼', '⎽', '├', '┤', '┴', '┬', '│', '≤', '≥', 'π', '≠', '£', '·',
+];
+
+impl Charset {
+    fn map(self, ch: char) -> char {
+        match (self, ch) {
+            (Charset::DecGraphics, '_'..='~') => DEC_GRAPHICS[ch as usize - '_' as usize],
+            _ => ch,
+        }
+    }
+}
 
 /// Mouse reporting mode requested by DEC private mode sequences.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -114,13 +141,25 @@ enum State {
     /// the next byte decides whether to consume it (`\`) or treat `ESC` as
     /// having aborted the OSC and start a fresh escape sequence.
     OscEsc,
-    /// Consume exactly one following byte (e.g. charset-select `ESC ( X`).
+    /// Consume exactly one following byte (e.g. `ESC % G`).
     SkipOne,
+    /// `ESC (` or `ESC )` seen: the next byte names the charset for G0 / G1.
+    Charset(usize),
+    /// `ESC #` seen: `8` fills the screen with `E` (DECALN).
+    Hash,
     /// Inside a DCS, SOS, PM or APC string: ignored up to its terminator,
     /// so payloads like sixel or XTGETTCAP never print as text.
     Str,
     /// Saw `ESC` inside such a string; `ESC \` ends it (ST).
     StrEsc,
+}
+
+/// DA1: a VT220 with ANSI colour.
+const DA1: &[u8] = b"\x1b[?62;22c";
+
+/// A stop every 8 columns.
+fn default_tabs(cols: usize) -> Vec<bool> {
+    (0..cols).map(|c| c % TAB == 0 && c > 0).collect()
 }
 
 pub struct Vt {
@@ -134,12 +173,28 @@ pub struct Vt {
     state: State,
     params: Vec<u32>,
     cur_param: Option<u32>,
-    /// Set when CSI was introduced with `?` (DEC private mode sequences).
-    csi_private: bool,
-    /// Set when CSI was introduced with `>` (secondary device attributes).
-    csi_greater: bool,
-    /// Set when CSI includes a space intermediate byte (e.g. DECSCUSR).
-    csi_intermediate_space: bool,
+    /// Whether each of `params` came after a `:`, a sub-param of the one
+    /// before it (`4:3`, `38:2::r:g:b`).
+    subs: Vec<bool>,
+    /// The param being read came after a `:`.
+    cur_sub: bool,
+    /// The private marker before the params: `?`, `>`, `<` or `=`.
+    csi_marker: Option<char>,
+    /// The intermediate byte before the final (`SP`, `$`, `!`, `"`).
+    csi_inter: Option<char>,
+    /// G0 and G1, and which of them is in use (SI picks 0, SO picks 1).
+    charsets: [Charset; 2],
+    gl: usize,
+    /// Tab stops, one flag per column; every 8th to start, HTS and TBC change them.
+    tabs: Vec<bool>,
+    /// IRM (`CSI 4 h`): printing pushes the rest of the line right.
+    insert_mode: bool,
+    /// LNM (`CSI 20 h`): a line feed also returns the carriage.
+    newline_mode: bool,
+    /// The last character printed, for REP (`CSI b`).
+    last_printed: Option<char>,
+    /// Titles saved by `CSI 22 t`, restored by `CSI 23 t`.
+    titles: Vec<Option<String>>,
     /// Trailing bytes of an as-yet-incomplete UTF-8 sequence, held over to the
     /// next `process` call (a multi-byte scalar can be split across reads).
     pending_utf8: Vec<u8>,
@@ -168,6 +223,7 @@ pub struct Vt {
     saved_cx: usize,
     saved_cy: usize,
     saved_pen: Pen,
+    saved_charsets: ([Charset; 2], usize),
     has_saved_cursor: bool,
 
     // ── DSR response bytes queued for write-back to the PTY ────────────────
@@ -226,9 +282,17 @@ impl Vt {
             state: State::Ground,
             params: Vec::new(),
             cur_param: None,
-            csi_private: false,
-            csi_greater: false,
-            csi_intermediate_space: false,
+            subs: Vec::new(),
+            cur_sub: false,
+            csi_marker: None,
+            csi_inter: None,
+            charsets: [Charset::Ascii; 2],
+            gl: 0,
+            tabs: default_tabs(cols),
+            insert_mode: false,
+            newline_mode: false,
+            last_printed: None,
+            titles: Vec::new(),
             pending_utf8: Vec::new(),
             pending_zwj: None,
             pending_regional: None,
@@ -240,6 +304,7 @@ impl Vt {
             saved_cx: 0,
             saved_cy: 0,
             saved_pen: Pen::new(),
+            saved_charsets: ([Charset::Ascii; 2], 0),
             has_saved_cursor: false,
             pending_response: Vec::new(),
             osc_buf: String::new(),
@@ -418,6 +483,20 @@ impl Vt {
                 }
             }
             State::SkipOne => self.state = State::Ground,
+            State::Charset(slot) => {
+                self.charsets[slot] = if ch == '0' {
+                    Charset::DecGraphics
+                } else {
+                    Charset::Ascii
+                };
+                self.state = State::Ground;
+            }
+            State::Hash => {
+                if ch == '8' {
+                    self.decaln();
+                }
+                self.state = State::Ground;
+            }
             State::Str => match ch {
                 '\u{7}' | '\u{18}' | '\u{1a}' => self.state = State::Ground,
                 '\u{1b}' => self.state = State::StrEsc,
@@ -456,12 +535,7 @@ impl Vt {
             }
             0x9B => {
                 self.break_clustering();
-                self.state = State::Csi;
-                self.params.clear();
-                self.cur_param = None;
-                self.csi_private = false;
-                self.csi_greater = false;
-                self.csi_intermediate_space = false;
+                self.start_csi();
                 true
             }
             0x9D => {
@@ -515,18 +589,28 @@ impl Vt {
             }
             '\n' | '\u{b}' | '\u{c}' => {
                 self.break_clustering();
+                if self.newline_mode {
+                    self.cx = 0;
+                }
                 self.linefeed();
             }
+            // SO and SI: G1 or G0 for what follows
+            '\u{e}' => self.gl = 1,
+            '\u{f}' => self.gl = 0,
             '\u{8}' => {
                 self.break_clustering();
                 self.cx = self.cx.saturating_sub(1);
             }
             '\t' => {
                 self.break_clustering();
-                self.cx = (((self.cx / TAB) + 1) * TAB).min(self.cols - 1);
+                self.cx = self.next_tab(self.cx);
             }
             c if (c as u32) < 0x20 || c == '\u{7f}' => self.break_clustering(),
-            c => self.put(c),
+            c => {
+                let c = self.charsets[self.gl].map(c);
+                self.last_printed = Some(c);
+                self.put(c);
+            }
         }
     }
 
@@ -535,21 +619,104 @@ impl Vt {
         self.pending_regional = None;
     }
 
+    fn start_csi(&mut self) {
+        self.state = State::Csi;
+        self.params.clear();
+        self.subs.clear();
+        self.cur_param = None;
+        self.cur_sub = false;
+        self.csi_marker = None;
+        self.csi_inter = None;
+    }
+
+    /// The next tab stop right of `col`, or the last column.
+    fn next_tab(&self, col: usize) -> usize {
+        let from = col.min(self.cols - 1) + 1;
+        (from..self.cols)
+            .find(|&c| self.tabs[c])
+            .unwrap_or(self.cols - 1)
+    }
+
+    /// The tab stop left of `col`, or column 0.
+    fn prev_tab(&self, col: usize) -> usize {
+        (0..col.min(self.cols))
+            .rev()
+            .find(|&c| self.tabs[c])
+            .unwrap_or(0)
+    }
+
+    /// DECALN: the screen full of `E`, margins reset, cursor home.
+    fn decaln(&mut self) {
+        let e = Cell {
+            kind: CellKind::Char('E'),
+            ..Cell::blank()
+        };
+        for row in &mut self.screen {
+            row.fill(e.clone());
+        }
+        self.scroll_top = 0;
+        self.scroll_bottom = self.rows - 1;
+        self.cx = 0;
+        self.cy = 0;
+    }
+
+    /// DECSTR: modes, pen and margins back to their start; the screen stays.
+    fn soft_reset(&mut self) {
+        self.cursor_visible = true;
+        self.origin_mode = false;
+        self.wraparound = true;
+        self.insert_mode = false;
+        self.application_cursor_keys = false;
+        self.application_keypad = false;
+        self.pen.reset();
+        self.charsets = [Charset::Ascii; 2];
+        self.gl = 0;
+        self.scroll_top = 0;
+        self.scroll_bottom = self.rows - 1;
+        self.saved_cx = 0;
+        self.saved_cy = 0;
+        self.saved_pen = Pen::new();
+        self.saved_charsets = ([Charset::Ascii; 2], 0);
+    }
+
     fn esc(&mut self, ch: char) {
         match ch {
-            '[' => {
-                self.state = State::Csi;
-                self.params.clear();
-                self.cur_param = None;
-                self.csi_private = false;
-                self.csi_greater = false;
-                self.csi_intermediate_space = false;
-            }
+            '[' => self.start_csi(),
             ']' => {
                 self.osc_buf.clear();
                 self.state = State::Osc;
             }
-            '(' | ')' | '*' | '+' => self.state = State::SkipOne,
+            '(' => self.state = State::Charset(0),
+            ')' => self.state = State::Charset(1),
+            '#' => self.state = State::Hash,
+            // G2 / G3 designations and other two-byte forms (`ESC % G`,
+            // `ESC SP F`): their last byte is part of the sequence
+            '*' | '+' | '%' | ' ' | '-' | '.' | '/' => self.state = State::SkipOne,
+            '=' => {
+                self.application_keypad = true;
+                self.state = State::Ground;
+            }
+            '>' => {
+                self.application_keypad = false;
+                self.state = State::Ground;
+            }
+            // HTS: a tab stop at the cursor
+            'H' => {
+                let col = self.cx.min(self.cols - 1);
+                self.tabs[col] = true;
+                self.state = State::Ground;
+            }
+            // NEL: next line, first column
+            'E' => {
+                self.cx = 0;
+                self.linefeed();
+                self.state = State::Ground;
+            }
+            // DECID: answered like DA1
+            'Z' => {
+                self.pending_response.extend_from_slice(DA1);
+                self.state = State::Ground;
+            }
             'P' | 'X' | '^' | '_' => self.state = State::Str,
             '7' => {
                 self.decsc();
@@ -599,17 +766,20 @@ impl Vt {
                 let value = self.cur_param.take().unwrap_or(0);
                 if self.params.len() < MAX_PARAMS {
                     self.params.push(value);
+                    self.subs.push(self.cur_sub);
+                }
+                self.cur_sub = ch == ':';
+            }
+            '<'..='?' => {
+                if self.params.is_empty() && self.cur_param.is_none() {
+                    self.csi_marker = Some(ch);
                 }
             }
-            '?' => self.csi_private = true,
-            ' ' => self.csi_intermediate_space = true,
-            '>' => self.csi_greater = true,
-            '!' | '=' => {}
+            ' '..='/' => self.csi_inter = Some(ch),
             '\u{40}'..='\u{7e}' => {
-                if let Some(p) = self.cur_param.take()
-                    && self.params.len() < MAX_PARAMS
-                {
-                    self.params.push(p);
+                if (self.cur_param.is_some() || self.cur_sub) && self.params.len() < MAX_PARAMS {
+                    self.params.push(self.cur_param.take().unwrap_or(0));
+                    self.subs.push(self.cur_sub);
                 }
                 self.break_clustering();
                 self.dispatch_csi(ch);
@@ -632,7 +802,44 @@ impl Vt {
     }
 
     fn dispatch_csi(&mut self, final_ch: char) {
-        if self.csi_intermediate_space {
+        match (self.csi_marker, self.csi_inter, final_ch) {
+            (None, None, _) => {}
+            (Some('?'), None, _) => return self.dispatch_private(final_ch),
+            (Some('?'), Some('$'), 'p') => {
+                let mode = self.param(0, 0);
+                let state = self.dec_mode(mode);
+                self.reply(&format!("\x1b[?{mode};{state}$y"));
+                return;
+            }
+            (None, Some('$'), 'p') => {
+                let mode = self.param(0, 0);
+                let state = match mode {
+                    4 => 2 - u32::from(self.insert_mode),
+                    20 => 2 - u32::from(self.newline_mode),
+                    _ => 0,
+                };
+                self.reply(&format!("\x1b[{mode};{state}$y"));
+                return;
+            }
+            (Some('>'), None, 'c') => {
+                self.pending_response.extend_from_slice(b"\x1b[>0;1;0c");
+                return;
+            }
+            // XTVERSION
+            (Some('>'), None, 'q') => {
+                let version = env!("CARGO_PKG_VERSION");
+                self.reply(&format!("\x1bP>|vanta {version}\x1b\\"));
+                return;
+            }
+            (None, Some('!'), 'p') => return self.soft_reset(),
+            (None, Some(' '), 'q') => {}
+            // everything else with a marker or an intermediate: the kitty
+            // keyboard forms (`CSI > 1 u`), modifyOtherKeys (`CSI > 4 ; 1 m`)
+            // and the rest are not plain cursor or SGR commands
+            _ => return,
+        }
+
+        if self.csi_inter == Some(' ') {
             if final_ch == 'q' {
                 self.cursor_style = match self.param(0, 0) {
                     0 => CursorStyle::Default,
@@ -648,37 +855,8 @@ impl Vt {
             return;
         }
 
-        if self.csi_private {
-            match final_ch {
-                'h' => {
-                    for i in 0..self.params.len() {
-                        self.dispatch_decset(self.params[i]);
-                    }
-                }
-                'l' => {
-                    for i in 0..self.params.len() {
-                        self.dispatch_decrst(self.params[i]);
-                    }
-                }
-                'n' if self.param(0, 0) == 6 => {
-                    let row = self.cy + 1;
-                    let col = self.cx.min(self.cols - 1) + 1;
-                    let resp = format!("\x1b[?{row};{col}R");
-                    self.pending_response.extend_from_slice(resp.as_bytes());
-                }
-                _ => {}
-            }
-            return;
-        }
-
         match final_ch {
-            'c' => {
-                if self.csi_greater {
-                    self.pending_response.extend_from_slice(b"\x1b[>0;1;0c");
-                } else {
-                    self.pending_response.extend_from_slice(b"\x1b[?1;2c");
-                }
-            }
+            'c' => self.pending_response.extend_from_slice(DA1),
             'A' => self.cy = self.cy.saturating_sub(self.param(0, 1) as usize),
             'B' | 'e' => self.cy = (self.cy + self.param(0, 1) as usize).min(self.rows - 1),
             'C' | 'a' => self.cx = (self.cx + self.param(0, 1) as usize).min(self.cols - 1),
@@ -724,7 +902,7 @@ impl Vt {
                     self.scroll_bottom = bot;
                 }
                 self.cx = 0;
-                self.cy = 0;
+                self.cy = if self.origin_mode { self.scroll_top } else { 0 };
             }
             's' => self.decsc(),
             'u' => self.decrc(),
@@ -762,16 +940,128 @@ impl Vt {
             'n' => match self.param(0, 0) {
                 5 => self.pending_response.extend_from_slice(b"\x1b[0n"),
                 6 => {
-                    let row = self.cy + 1;
-                    let col = self.cx.min(self.cols - 1) + 1;
-                    let resp = format!("\x1b[{row};{col}R");
-                    self.pending_response.extend_from_slice(resp.as_bytes());
+                    let (row, col) = self.report_position();
+                    self.reply(&format!("\x1b[{row};{col}R"));
                 }
                 _ => {}
             },
             'm' => self.sgr(),
+            // REP: the last character again, n times
+            'b' => {
+                if let Some(c) = self.last_printed {
+                    let n = (self.param(0, 1) as usize).min(self.cols * self.rows);
+                    for _ in 0..n {
+                        self.put(c);
+                    }
+                }
+            }
+            // TBC: 0 clears the stop at the cursor, 3 all of them
+            'g' => match self.param(0, 0) {
+                0 => {
+                    let col = self.cx.min(self.cols - 1);
+                    self.tabs[col] = false;
+                }
+                3 => self.tabs.fill(false),
+                _ => {}
+            },
+            'I' => {
+                for _ in 0..self.param(0, 1).min(self.cols as u32) {
+                    self.cx = self.next_tab(self.cx);
+                }
+            }
+            'Z' => {
+                for _ in 0..self.param(0, 1).min(self.cols as u32) {
+                    self.cx = self.prev_tab(self.cx);
+                }
+            }
+            'h' | 'l' => {
+                let on = final_ch == 'h';
+                for i in 0..self.params.len() {
+                    match self.params[i] {
+                        4 => self.insert_mode = on,
+                        20 => self.newline_mode = on,
+                        _ => {}
+                    }
+                }
+            }
+            't' => match self.param(0, 0) {
+                18 => {
+                    let (rows, cols) = (self.rows, self.cols);
+                    self.reply(&format!("\x1b[8;{rows};{cols}t"));
+                }
+                22 => {
+                    if self.titles.len() == MAX_TITLES {
+                        self.titles.remove(0);
+                    }
+                    self.titles.push(self.title.clone());
+                }
+                23 => {
+                    if let Some(title) = self.titles.pop() {
+                        self.title = title;
+                    }
+                }
+                _ => {}
+            },
             _ => {}
         }
+    }
+
+    /// `CSI ? ...` sequences.
+    fn dispatch_private(&mut self, final_ch: char) {
+        match final_ch {
+            'h' => {
+                for i in 0..self.params.len() {
+                    self.dispatch_decset(self.params[i]);
+                }
+            }
+            'l' => {
+                for i in 0..self.params.len() {
+                    self.dispatch_decrst(self.params[i]);
+                }
+            }
+            'n' if self.param(0, 0) == 6 => {
+                let (row, col) = self.report_position();
+                self.reply(&format!("\x1b[?{row};{col}R"));
+            }
+            _ => {}
+        }
+    }
+
+    /// The cursor as a cursor position report gives it: 1-based, and from
+    /// the top margin in origin mode.
+    fn report_position(&self) -> (usize, usize) {
+        let row = if self.origin_mode {
+            self.cy.saturating_sub(self.scroll_top)
+        } else {
+            self.cy
+        };
+        (row + 1, self.cx.min(self.cols - 1) + 1)
+    }
+
+    /// A DECRQM answer for DEC mode `mode`: 1 set, 2 reset, 0 not known.
+    fn dec_mode(&self, mode: u32) -> u32 {
+        let on = match mode {
+            1 => self.application_cursor_keys,
+            6 => self.origin_mode,
+            7 => self.wraparound,
+            25 => self.cursor_visible,
+            66 => self.application_keypad,
+            47 | 1047 | 1049 => self.alt_active,
+            1000 => self.mouse_tracking == MouseTracking::Press,
+            1002 => self.mouse_tracking == MouseTracking::Drag,
+            1003 => self.mouse_tracking == MouseTracking::Any,
+            1004 => self.focus_tracking,
+            1005 => self.mouse_protocol == MouseProtocol::Utf8,
+            1006 => self.mouse_protocol == MouseProtocol::Sgr,
+            1015 => self.mouse_protocol == MouseProtocol::Urxvt,
+            2004 => self.bracketed_paste,
+            _ => return 0,
+        };
+        if on { 1 } else { 2 }
+    }
+
+    fn reply(&mut self, text: &str) {
+        self.pending_response.extend_from_slice(text.as_bytes());
     }
 
     fn dispatch_decset(&mut self, mode: u32) {
@@ -842,6 +1132,7 @@ impl Vt {
         self.saved_cx = self.cx;
         self.saved_cy = self.cy;
         self.saved_pen = self.pen.clone();
+        self.saved_charsets = (self.charsets, self.gl);
         self.has_saved_cursor = true;
     }
 
@@ -850,6 +1141,7 @@ impl Vt {
             self.cx = self.saved_cx.min(self.cols - 1);
             self.cy = self.saved_cy.min(self.rows - 1);
             self.pen = self.saved_pen.clone();
+            (self.charsets, self.gl) = self.saved_charsets;
         }
     }
 
@@ -1300,7 +1592,7 @@ mod tests {
     fn device_attribute_queries_are_answered() {
         let mut vt = Vt::new(20, 5);
         vt.process(b"\x1b[c");
-        assert_eq!(vt.take_response().unwrap(), b"\x1b[?1;2c");
+        assert_eq!(vt.take_response().unwrap(), b"\x1b[?62;22c");
 
         vt.process(b"\x1b[>c");
         assert_eq!(vt.take_response().unwrap(), b"\x1b[>0;1;0c");
@@ -1643,5 +1935,129 @@ mod tests {
         let cells = vt.render_cells();
         assert_eq!(cells[0][0].width, 2);
         assert_eq!(cells[0][2].ch(), 'X');
+    }
+
+    #[test]
+    fn resize_mid_emoji_join_never_panics() {
+        let mut vt = Vt::new(10, 2);
+        vt.process("abcdefgh\u{1f9d1}\u{200d}".as_bytes());
+        vt.resize(4, 2);
+        vt.process("\u{1f4bb}x".as_bytes());
+        vt.resize(1, 1);
+        vt.process("\u{1f1f0}".as_bytes());
+        vt.resize(3, 3);
+        vt.process("\u{1f1f7}".as_bytes());
+    }
+
+    #[test]
+    fn dec_line_drawing_draws_boxes() {
+        assert_eq!(render("\x1b(0lqqk\x1b(Bx").trim_end(), "┌──┐x");
+        // SO switches to G1, SI back to G0
+        assert_eq!(render("\x1b)0a\x0eqx\x0fq").trim_end(), "a─│q");
+    }
+
+    #[test]
+    fn charsets_are_saved_with_the_cursor() {
+        assert_eq!(render("\x1b(0\x1b7\x1b(B\x1b8q").trim_end(), "─");
+    }
+
+    #[test]
+    fn marked_csi_forms_are_not_plain_commands() {
+        let mut vt = Vt::new(10, 2);
+        vt.process(b"ab\x1b7\x1b[1;5H");
+        // kitty keyboard push / pop / query must not restore the cursor
+        vt.process(b"\x1b[>1u\x1b[<u\x1b[=1;1u\x1b[?u");
+        assert_eq!(vt.cursor(), (0, 4));
+        // modifyOtherKeys must not turn on underline and bold
+        vt.process(b"\x1b[>4;1mX");
+        assert_eq!(vt.screen[0][4].attrs, Attrs::default());
+    }
+
+    #[test]
+    fn unknown_escapes_never_leak_their_last_byte() {
+        assert_eq!(render("a\x1b%Gb\x1b Fc").trim_end(), "abc");
+        assert_eq!(
+            render("\x1b#8").lines().next(),
+            Some("EEEEEEEEEEEEEEEEEEEE")
+        );
+    }
+
+    #[test]
+    fn keypad_mode_follows_esc_equals() {
+        let mut vt = Vt::new(10, 2);
+        vt.process(b"\x1b=");
+        assert!(vt.application_keypad());
+        vt.process(b"\x1b>");
+        assert!(!vt.application_keypad());
+    }
+
+    #[test]
+    fn rep_repeats_the_last_character() {
+        assert_eq!(render("-\x1b[4b|").trim_end(), "-----|");
+        let mut vt = Vt::new(4, 2);
+        vt.process(b"x\x1b[65535b");
+        assert_eq!(vt.render(), "xxxx\nxxxx\nx", "capped at one screen");
+    }
+
+    #[test]
+    fn tab_stops_can_be_set_and_cleared() {
+        assert_eq!(render("\tx").trim_end(), "        x");
+        assert_eq!(render("\x1b[3g\x1b[3G\x1bH\r\tx").trim_end(), "  x");
+        assert_eq!(render("\x1b[18G\x1b[2Zx").trim_end(), "        x");
+        assert_eq!(render("\x1b[2Ix").trim_end(), "                x");
+    }
+
+    #[test]
+    fn insert_mode_pushes_text_right() {
+        assert_eq!(render("abc\r\x1b[4hX\x1b[4lY").trim_end(), "XYbc");
+        assert_eq!(render("abc\r\x1b[4hXY").trim_end(), "XYabc");
+    }
+
+    #[test]
+    fn newline_mode_returns_the_carriage() {
+        assert_eq!(render("\x1b[20hab\ncd").trim_end(), "ab\ncd");
+    }
+
+    #[test]
+    fn mode_and_version_queries_are_answered() {
+        let mut vt = Vt::new(10, 4);
+        vt.process(b"\x1b[?2004h\x1b[?2004$p\x1b[?25l\x1b[?25$p\x1b[?9999$p\x1b[4$p");
+        assert_eq!(
+            vt.take_response(),
+            Some(b"\x1b[?2004;1$y\x1b[?25;2$y\x1b[?9999;0$y\x1b[4;2$y".to_vec())
+        );
+        vt.process(b"\x1b[>q");
+        let reply = String::from_utf8(vt.take_response().unwrap()).unwrap();
+        assert!(reply.starts_with("\x1bP>|vanta ") && reply.ends_with("\x1b\\"));
+        vt.process(b"\x1b[18t\x1b[c");
+        assert_eq!(
+            vt.take_response(),
+            Some(b"\x1b[8;4;10t\x1b[?62;22c".to_vec())
+        );
+    }
+
+    #[test]
+    fn origin_mode_reports_from_the_margin() {
+        let mut vt = Vt::new(10, 6);
+        vt.process(b"\x1b[?6h\x1b[3;5r\x1b[2;3H\x1b[6n");
+        assert_eq!(vt.take_response(), Some(b"\x1b[2;3R".to_vec()));
+    }
+
+    #[test]
+    fn soft_reset_keeps_the_screen() {
+        let mut vt = Vt::new(10, 2);
+        vt.process(b"keep\x1b[?25l\x1b[4h\x1b[1m\x1b[!pX");
+        assert!(vt.cursor_visible());
+        assert_eq!(vt.render().trim_end(), "keepX");
+        assert_eq!(vt.screen[0][4].attrs, Attrs::default());
+    }
+
+    #[test]
+    fn titles_can_be_saved_and_restored() {
+        let mut vt = Vt::new(10, 2);
+        vt.process(b"\x1b]2;shell\x07\x1b[22t\x1b]2;vim\x07");
+        assert_eq!(vt.title(), Some("vim"));
+        vt.process(b"\x1b[23t");
+        assert_eq!(vt.title(), Some("shell"));
     }
 }
