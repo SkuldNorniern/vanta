@@ -18,6 +18,10 @@ mod grid;
 mod osc;
 pub use osc::{Event, Palette, Rgb};
 
+mod reflow;
+use reflow::Row;
+
+use std::collections::VecDeque;
 use std::mem;
 use std::str;
 use std::time::{Duration, Instant};
@@ -172,8 +176,8 @@ fn default_tabs(cols: usize) -> Vec<bool> {
 pub struct Vt {
     cols: usize,
     rows: usize,
-    screen: Vec<Vec<Cell>>, // rows x cols
-    scrollback: Vec<Vec<Cell>>,
+    screen: Vec<Row>, // rows x cols
+    scrollback: VecDeque<Row>,
     cx: usize,
     cy: usize,
     pen: Pen,
@@ -229,9 +233,9 @@ pub struct Vt {
     /// Whether the alternate screen is currently active.
     alt_active: bool,
     /// The alternate screen cell buffer (swapped with `screen` on entry/exit).
-    alt_cells: Vec<Vec<Cell>>,
+    alt_cells: Vec<Row>,
     /// Normal-screen scrollback saved while the alternate screen is active.
-    saved_scrollback: Vec<Vec<Cell>>,
+    saved_scrollback: VecDeque<Row>,
 
     // ── Save/restore cursor (ESC 7/8, DECSC/DECRC, also DECSET 1049) ──────
     saved_cx: usize,
@@ -290,8 +294,8 @@ impl Vt {
         Self {
             cols,
             rows,
-            screen: vec![vec![Cell::blank(); cols]; rows],
-            scrollback: Vec::new(),
+            screen: vec![Row::blank(cols); rows],
+            scrollback: VecDeque::new(),
             cx: 0,
             cy: 0,
             pen: Pen::new(),
@@ -320,8 +324,8 @@ impl Vt {
             scroll_top: 0,
             scroll_bottom: rows - 1,
             alt_active: false,
-            alt_cells: vec![vec![Cell::blank(); cols]; rows],
-            saved_scrollback: Vec::new(),
+            alt_cells: vec![Row::blank(cols); rows],
+            saved_scrollback: VecDeque::new(),
             saved_cx: 0,
             saved_cy: 0,
             saved_pen: Pen::new(),
@@ -1181,9 +1185,7 @@ impl Vt {
             self.decsc();
         }
         for row in &mut self.alt_cells {
-            for cell in row.iter_mut() {
-                *cell = Cell::blank();
-            }
+            *row = Row::blank(self.cols);
         }
         mem::swap(&mut self.screen, &mut self.alt_cells);
         mem::swap(&mut self.scrollback, &mut self.saved_scrollback);
