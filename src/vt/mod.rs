@@ -15,6 +15,9 @@ mod width;
 
 mod grid;
 
+mod osc;
+pub use osc::{Event, Palette, Rgb};
+
 use std::mem;
 use std::str;
 
@@ -195,6 +198,13 @@ pub struct Vt {
     last_printed: Option<char>,
     /// Titles saved by `CSI 22 t`, restored by `CSI 23 t`.
     titles: Vec<Option<String>>,
+    /// Colours now, and the host's to answer resets from.
+    palette: Box<Palette>,
+    base_palette: Box<Palette>,
+    palette_version: u64,
+    /// From OSC 7.
+    cwd: Option<String>,
+    events: Vec<Event>,
     /// Trailing bytes of an as-yet-incomplete UTF-8 sequence, held over to the
     /// next `process` call (a multi-byte scalar can be split across reads).
     pending_utf8: Vec<u8>,
@@ -293,6 +303,11 @@ impl Vt {
             newline_mode: false,
             last_printed: None,
             titles: Vec::new(),
+            palette: Box::default(),
+            base_palette: Box::default(),
+            palette_version: 0,
+            cwd: None,
+            events: Vec::new(),
             pending_utf8: Vec::new(),
             pending_zwj: None,
             pending_regional: None,
@@ -455,11 +470,11 @@ impl Vt {
             State::Csi => self.csi(ch),
             State::Osc => match ch {
                 '\u{7}' => {
-                    self.finish_osc();
+                    self.finish_osc(true);
                     self.state = State::Ground;
                 }
                 '\u{1b}' => {
-                    self.finish_osc();
+                    self.finish_osc(false);
                     self.state = State::OscEsc;
                 }
                 // CAN and SUB cancel the string
@@ -468,7 +483,7 @@ impl Vt {
                     self.state = State::Ground;
                 }
                 _ => {
-                    if self.osc_buf.len() < MAX_OSC {
+                    if self.osc_buf.len() < self.osc_cap() {
                         self.osc_buf.push(ch);
                     }
                 }
@@ -553,27 +568,12 @@ impl Vt {
             // ST ends whatever string is open
             0x9C => {
                 if self.state == State::Osc {
-                    self.finish_osc();
+                    self.finish_osc(false);
                 }
                 self.state = State::Ground;
                 true
             }
             _ => false,
-        }
-    }
-
-    fn finish_osc(&mut self) {
-        let buf = mem::take(&mut self.osc_buf);
-        if buf.starts_with("0;") || buf.starts_with("2;") {
-            self.title = Some(buf[2..].to_owned());
-        } else if let Some(rest) = buf.strip_prefix("8;") {
-            if let Some((_, uri)) = rest.split_once(';') {
-                self.pen.hyperlink = if uri.is_empty() {
-                    None
-                } else {
-                    Some(uri.to_owned().into_boxed_str())
-                };
-            }
         }
     }
 
@@ -605,6 +605,7 @@ impl Vt {
                 self.break_clustering();
                 self.cx = self.next_tab(self.cx);
             }
+            '\u{7}' => self.push_event(Event::Bell),
             c if (c as u32) < 0x20 || c == '\u{7f}' => self.break_clustering(),
             c => {
                 let c = self.charsets[self.gl].map(c);
@@ -742,9 +743,13 @@ impl Vt {
             }
             // ESC c — Full reset (RIS): reinitialise all state.
             'c' => {
-                let cols = self.cols;
-                let rows = self.rows;
-                *self = Self::new(cols, rows);
+                let base = mem::take(&mut self.base_palette);
+                let version = self.palette_version;
+                let events = mem::take(&mut self.events);
+                *self = Self::new(self.cols, self.rows);
+                self.set_palette(*base);
+                self.palette_version = version + 1;
+                self.events = events;
             }
             _ => self.state = State::Ground,
         }

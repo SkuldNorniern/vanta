@@ -18,7 +18,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use vt::Vt;
-pub use vt::{Cell, CellKind, Color, CursorStyle, MouseProtocol, MouseTracking};
+pub use vt::{
+    Cell, CellKind, Color, CursorStyle, Event, MouseProtocol, MouseTracking, Palette, Rgb,
+};
 
 pub use pty::SpawnConfig;
 
@@ -109,6 +111,12 @@ pub struct Window {
     pub closed: bool,
     /// Lines dropped off the top of scrollback so far; see [`Vt::dropped`].
     pub dropped: u64,
+    pub cursor_style: CursorStyle,
+    pub focus_tracking: bool,
+    pub mouse_tracking: MouseTracking,
+    pub mouse_protocol: MouseProtocol,
+    /// Bumped when the app changes colours; read [`Terminal::palette`] then.
+    pub palette_version: u64,
 }
 
 /// A running shell on a PTY, with its output rendered through a VT grid.
@@ -331,6 +339,11 @@ impl Terminal {
                 application_cursor_keys: v.application_cursor_keys(),
                 closed,
                 dropped: v.dropped(),
+                cursor_style: v.cursor_style(),
+                focus_tracking: v.focus_tracking_enabled(),
+                mouse_tracking: v.mouse_tracking(),
+                mouse_protocol: v.mouse_protocol(),
+                palette_version: v.palette_version(),
             })
             .unwrap_or(Window {
                 lines: 0,
@@ -343,7 +356,43 @@ impl Terminal {
                 application_cursor_keys: false,
                 closed,
                 dropped: 0,
+                cursor_style: CursorStyle::Default,
+                focus_tracking: false,
+                mouse_tracking: MouseTracking::Off,
+                mouse_protocol: MouseProtocol::X10,
+                palette_version: 0,
             })
+    }
+
+    /// The colours apps see: the host's from [`Self::set_palette`], with
+    /// their OSC 4 / 10 / 11 / 12 changes on top.
+    pub fn palette(&self) -> Palette {
+        self.vt
+            .lock()
+            .map(|v| v.palette().clone())
+            .unwrap_or_default()
+    }
+
+    /// Tells apps the colours the host draws with, so a colour query (vim
+    /// asking for the background over ssh, say) gets the real answer.
+    pub fn set_palette(&self, palette: Palette) {
+        if let Ok(mut v) = self.vt.lock() {
+            v.set_palette(palette);
+            self.version.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    /// Bells and OSC 52 clipboard writes since the last call.
+    pub fn take_events(&self) -> Vec<Event> {
+        self.vt
+            .lock()
+            .map(|mut v| v.take_events())
+            .unwrap_or_default()
+    }
+
+    /// The shell's working directory, when it reports it with OSC 7.
+    pub fn cwd(&self) -> Option<String> {
+        self.vt.lock().ok().and_then(|v| v.cwd().map(str::to_owned))
     }
 
     /// The current window title set by the shell via OSC 0/2, if any.
