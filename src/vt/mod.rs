@@ -21,6 +21,9 @@ pub use osc::{Event, Palette, Rgb};
 mod reflow;
 use reflow::Row;
 
+mod find;
+pub use find::Found;
+
 use std::collections::VecDeque;
 use std::mem;
 use std::str;

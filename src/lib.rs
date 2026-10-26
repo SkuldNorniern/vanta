@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use vt::Vt;
 pub use vt::{
-    Cell, CellKind, Color, CursorStyle, Event, MouseProtocol, MouseTracking, Palette, Rgb,
+    Cell, CellKind, Color, CursorStyle, Event, Found, MouseProtocol, MouseTracking, Palette, Rgb,
 };
 
 pub use pty::SpawnConfig;
@@ -446,6 +446,16 @@ impl Terminal {
     }
 
     /// The shell's working directory, when it reports it with OSC 7.
+    /// Every match of `needle` in scrollback and screen, with the
+    /// `dropped` count they were found at, so a host can keep them on
+    /// their lines as more drop off. Smart case, see [`Vt::find_all`].
+    pub fn find_all(&self, needle: &str) -> (u64, Vec<Found>) {
+        self.vt
+            .lock()
+            .map(|v| (v.dropped(), v.find_all(needle)))
+            .unwrap_or_default()
+    }
+
     pub fn cwd(&self) -> Option<String> {
         self.vt.lock().ok().and_then(|v| v.cwd().map(str::to_owned))
     }
