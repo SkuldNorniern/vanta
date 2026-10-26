@@ -445,7 +445,6 @@ impl Terminal {
             .unwrap_or_default()
     }
 
-    /// The shell's working directory, when it reports it with OSC 7.
     /// Every match of `needle` in scrollback and screen, with the
     /// `dropped` count they were found at, so a host can keep them on
     /// their lines as more drop off. Smart case, see [`Vt::find_all`].
@@ -456,6 +455,24 @@ impl Terminal {
             .unwrap_or_default()
     }
 
+    /// [`Self::find_all`] on a thread of its own; `done` gets the result
+    /// there. A ui never waits on the scan.
+    pub fn find_all_in_background(
+        &self,
+        needle: String,
+        done: impl FnOnce((u64, Vec<Found>)) + Send + 'static,
+    ) {
+        let vt = Arc::clone(&self.vt);
+        thread::spawn(move || {
+            let found = vt
+                .lock()
+                .map(|v| (v.dropped(), v.find_all(&needle)))
+                .unwrap_or_default();
+            done(found);
+        });
+    }
+
+    /// The shell's working directory, when it reports it with OSC 7.
     pub fn cwd(&self) -> Option<String> {
         self.vt.lock().ok().and_then(|v| v.cwd().map(str::to_owned))
     }

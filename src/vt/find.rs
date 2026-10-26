@@ -1,8 +1,11 @@
 //! Searching scrollback and the screen. A fourth `impl Vt` block.
 
+use std::collections::VecDeque;
+
 use super::{CellKind, Vt};
 
-/// Matches kept per search; a one-letter search in a full scrollback stops here.
+/// Matches kept per search, the newest ones: a one-letter search in a full
+/// scrollback still finds what is near the prompt.
 pub const MAX_FOUND: usize = 10_000;
 
 /// One match, first and last cell, as `(line, col)` over scrollback then
@@ -26,9 +29,9 @@ impl Vt {
             }
         };
         let needle: Vec<char> = needle.chars().map(fold).collect();
-        let mut found = Vec::new();
+        let mut found = VecDeque::new();
         if needle.is_empty() {
-            return found;
+            return Vec::new();
         }
         // one logical line at a time, so a match can cross a wrap
         let mut text: Vec<char> = Vec::new();
@@ -60,12 +63,12 @@ impl Vt {
             let mut i = 0;
             while i + needle.len() <= text.len() {
                 if text[i..i + needle.len()] == needle[..] {
-                    found.push(Found {
+                    found.push_back(Found {
                         start: at[i],
                         end: at[i + needle.len() - 1],
                     });
-                    if found.len() == MAX_FOUND {
-                        return found;
+                    if found.len() > MAX_FOUND {
+                        found.pop_front();
                     }
                     i += needle.len();
                 } else {
@@ -75,7 +78,7 @@ impl Vt {
             text.clear();
             at.clear();
         }
-        found
+        found.into()
     }
 }
 
@@ -137,6 +140,9 @@ mod tests {
         for _ in 0..200 {
             vt.process(&[b'a'; 80]);
         }
-        assert_eq!(vt.find_all("a").len(), super::MAX_FOUND);
+        let found = vt.find_all("a");
+        assert_eq!(found.len(), super::MAX_FOUND);
+        // the newest kept: the last match is on the last line
+        assert_eq!(found.last().unwrap().start.0, vt.line_count() - 1);
     }
 }
