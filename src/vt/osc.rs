@@ -8,8 +8,6 @@ use super::Vt;
 /// Bytes an OSC 52 clipboard string may take; one copy of a big file from
 /// a remote vim still fits.
 pub(super) const MAX_CLIPBOARD_OSC: usize = 1 << 20;
-/// Events kept until the host takes them.
-const MAX_EVENTS: usize = 64;
 
 pub type Rgb = (u8, u8, u8);
 
@@ -101,10 +99,16 @@ impl Vt {
         mem::take(&mut self.events)
     }
 
+    /// Queues `event`. One bell stands for many, and only the newest
+    /// clipboard text counts, so the queue stays short and a flood of bells
+    /// never crowds out a copy.
     pub(super) fn push_event(&mut self, event: Event) {
-        if self.events.len() < MAX_EVENTS {
-            self.events.push(event);
+        match &event {
+            Event::Bell if self.events.contains(&Event::Bell) => return,
+            Event::Clipboard(_) => self.events.retain(|e| *e == Event::Bell),
+            Event::Bell => {}
         }
+        self.events.push(event);
     }
 
     fn set_current(&mut self, palette: Palette) {
@@ -166,8 +170,11 @@ impl Vt {
             }
             "7" => self.cwd = cwd_of(rest),
             "52" => {
-                let data = rest.split_once(';').map_or(rest, |(_, data)| data);
-                if data != "?"
+                // `52;targets;data`; no data, or `?` asking to read it back,
+                // does nothing
+                if let Some((_, data)) = rest.split_once(';')
+                    && !data.is_empty()
+                    && data != "?"
                     && let Some(bytes) = base64(data)
                 {
                     let text = String::from_utf8_lossy(&bytes).into_owned();
@@ -353,6 +360,7 @@ mod tests {
     fn clipboard_writes_become_events_and_reads_are_refused() {
         let mut vt = Vt::new(10, 2);
         vt.process(b"\x1b]52;c;aGVsbG8g7ZWc\x07\x1b]52;c;?\x07\x1b]52;c;!!\x07");
+        vt.process(b"\x1b]52;c\x07\x1b]52;c;\x07");
         assert_eq!(vt.take_events(), vec![Event::Clipboard("hello 한".into())]);
         assert_eq!(vt.take_response(), None);
         // big copies fit; past the cap the rest is dropped, never grown
@@ -370,7 +378,12 @@ mod tests {
         for _ in 0..1000 {
             vt.process(b"\x07");
         }
-        assert_eq!(vt.take_events().len(), MAX_EVENTS);
+        vt.process(b"\x1b]52;c;YQ==\x07\x1b]52;c;Yg==\x07\x07");
+        assert_eq!(
+            vt.take_events(),
+            vec![Event::Bell, Event::Clipboard("b".into())],
+            "one bell, the newest copy"
+        );
     }
 
     #[test]

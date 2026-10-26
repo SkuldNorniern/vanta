@@ -274,4 +274,20 @@ mod tests {
         vt.resize(8, 3);
         assert_eq!(lines(&vt)[..2], ["", "ef"]);
     }
+
+    #[test]
+    fn deleted_lines_take_their_wrap_with_them() {
+        let mut vt = Vt::new(10, 4);
+        vt.process(b"0123456789a\r\nxyz\x1b[2;1H\x1b[M");
+        vt.resize(20, 4);
+        assert_eq!(lines(&vt)[..2], ["0123456789", "xyz"]);
+    }
+
+    #[test]
+    fn inserted_lines_split_a_wrapped_line() {
+        let mut vt = Vt::new(10, 4);
+        vt.process(b"0123456789a\x1b[2;1H\x1b[L");
+        vt.resize(20, 4);
+        assert_eq!(lines(&vt)[..3], ["0123456789", "", "a"]);
+    }
 }

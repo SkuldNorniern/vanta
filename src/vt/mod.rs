@@ -189,6 +189,8 @@ pub struct Vt {
     subs: Vec<bool>,
     /// The param being read came after a `:`.
     cur_sub: bool,
+    /// The last byte was `;` or `:`: an empty param follows it (`CSI 1 ; m`).
+    after_sep: bool,
     /// The private marker before the params: `?`, `>`, `<` or `=`.
     csi_marker: Option<char>,
     /// The intermediate byte before the final (`SP`, `$`, `!`, `"`).
@@ -304,6 +306,7 @@ impl Vt {
             cur_param: None,
             subs: Vec::new(),
             cur_sub: false,
+            after_sep: false,
             csi_marker: None,
             csi_inter: None,
             charsets: [Charset::Ascii; 2],
@@ -648,6 +651,7 @@ impl Vt {
         self.subs.clear();
         self.cur_param = None;
         self.cur_sub = false;
+        self.after_sep = false;
         self.csi_marker = None;
         self.csi_inter = None;
     }
@@ -768,10 +772,15 @@ impl Vt {
                 let base = mem::take(&mut self.base_palette);
                 let version = self.palette_version;
                 let events = mem::take(&mut self.events);
+                let replies = mem::take(&mut self.pending_response);
+                // the old scrollback is gone; line numbers keep counting on
+                let dropped = self.dropped + self.scrollback.len() as u64;
                 *self = Self::new(self.cols, self.rows);
                 self.set_palette(*base);
                 self.palette_version = version + 1;
                 self.events = events;
+                self.pending_response = replies;
+                self.dropped = dropped;
             }
             _ => self.state = State::Ground,
         }
@@ -780,6 +789,7 @@ impl Vt {
     fn csi(&mut self, ch: char) {
         match ch {
             '0'..='9' => {
+                self.after_sep = false;
                 let d = ch as u32 - '0' as u32;
                 let value = self
                     .cur_param
@@ -796,6 +806,7 @@ impl Vt {
                     self.subs.push(self.cur_sub);
                 }
                 self.cur_sub = ch == ':';
+                self.after_sep = true;
             }
             '<'..='?' => {
                 if self.params.is_empty() && self.cur_param.is_none() {
@@ -804,7 +815,7 @@ impl Vt {
             }
             ' '..='/' => self.csi_inter = Some(ch),
             '\u{40}'..='\u{7e}' => {
-                if (self.cur_param.is_some() || self.cur_sub) && self.params.len() < MAX_PARAMS {
+                if (self.cur_param.is_some() || self.after_sep) && self.params.len() < MAX_PARAMS {
                     self.params.push(self.cur_param.take().unwrap_or(0));
                     self.subs.push(self.cur_sub);
                 }
@@ -2185,5 +2196,39 @@ mod tests {
         assert!(!vt.sync_held());
         vt.sync_since = Some(Instant::now() - super::SYNC_TIMEOUT);
         assert!(!vt.sync_held(), "timed out");
+    }
+
+    #[test]
+    fn insert_and_delete_never_split_wide_glyphs() {
+        let mut vt = Vt::new(4, 2);
+        vt.process("ab가\x1b[1G\x1b[4hx".as_bytes());
+        let row = &vt.screen[0];
+        assert!(row.iter().all(|c| c.width < 2 || c.kind != CellKind::Empty));
+        assert_ne!(row[3].width, 2, "no lone lead on the edge");
+        let mut vt = Vt::new(6, 2);
+        vt.process("a가bc\x1b[3G\x1b[P".as_bytes());
+        assert!(!is_continuation(&vt.screen[0][1]) || vt.screen[0][0].width == 2);
+        assert_eq!(
+            vt.screen[0][1].width, 1,
+            "the lead lost its half, so it went too"
+        );
+    }
+
+    #[test]
+    fn an_empty_last_param_counts() {
+        let mut vt = Vt::new(10, 2);
+        vt.process(b"\x1b[1mA\x1b[1;mB\x1b[4;mC");
+        assert!(!vt.screen[0][1].attrs.contains(Attrs::BOLD));
+        assert!(!vt.screen[0][2].attrs.contains(Attrs::UNDERLINE));
+    }
+
+    #[test]
+    fn full_reset_keeps_replies_and_line_numbers() {
+        let mut vt = Vt::new(4, 2);
+        vt.process(b"a\r\nb\r\nc\r\n");
+        let before = vt.dropped() + vt.scrollback.len() as u64;
+        vt.process(b"\x1b[5n\x1bc");
+        assert_eq!(vt.take_response(), Some(b"\x1b[0n".to_vec()));
+        assert_eq!(vt.dropped(), before);
     }
 }

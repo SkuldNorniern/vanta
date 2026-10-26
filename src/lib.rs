@@ -143,7 +143,14 @@ pub struct Terminal {
     /// writer thread. A child that stops reading never blocks the caller,
     /// and never blocks the reader thread answering a query (which would
     /// stop it draining output and deadlock both sides).
-    input: Sender<Vec<u8>>,
+    input: Sender<Input>,
+}
+
+/// What the writer thread does next, in the order asked.
+enum Input {
+    Bytes(Vec<u8>),
+    /// End the child's input, after everything queued before it.
+    Close,
 }
 
 impl Drop for Terminal {
@@ -260,7 +267,7 @@ impl Terminal {
     /// writer stopped, because the child's input closed.
     pub fn write_bytes(&self, bytes: &[u8]) -> io::Result<()> {
         self.input
-            .send(bytes.to_vec())
+            .send(Input::Bytes(bytes.to_vec()))
             .map_err(|_| io::Error::other("pty input closed"))
     }
 
@@ -471,8 +478,13 @@ impl Terminal {
     }
 
     /// Close the PTY input (signals EOF on the shell's stdin).
+    ///
+    /// Queued behind input not yet written, so it never waits on a child
+    /// that stopped reading.
     pub fn close_input(&self) -> io::Result<()> {
-        self.pty_io(|p| p.close_input())
+        self.input
+            .send(Input::Close)
+            .map_err(|_| io::Error::other("pty input closed"))
     }
 
     fn with_pty<R>(&self, f: impl FnOnce(&dyn pty::Pty) -> R) -> Option<R> {
@@ -486,10 +498,14 @@ impl Terminal {
 
 /// Writes queued input to the child in order. Ends when every sender is
 /// gone or the child's input closes.
-fn spawn_writer(outgoing: Receiver<Vec<u8>>, pty: Arc<dyn pty::Pty>) {
+fn spawn_writer(outgoing: Receiver<Input>, pty: Arc<dyn pty::Pty>) {
     thread::spawn(move || {
-        for bytes in outgoing {
-            if pty.write(&bytes).is_err() {
+        for input in outgoing {
+            let done = match input {
+                Input::Bytes(bytes) => pty.write(&bytes).is_err(),
+                Input::Close => pty.close_input().is_err(),
+            };
+            if done {
                 return;
             }
         }
@@ -500,7 +516,7 @@ fn spawn_reader<R: Read + Send + 'static>(
     mut reader: R,
     vt: Arc<Mutex<Vt>>,
     version: Arc<AtomicU64>,
-    replies: Sender<Vec<u8>>,
+    replies: Sender<Input>,
     closed: Arc<AtomicBool>,
     held: Arc<AtomicBool>,
     on_output: impl Fn() + Send + 'static,
@@ -538,7 +554,7 @@ fn spawn_reader<R: Read + Send + 'static>(
                     if let Some(bytes) = response {
                         // queued, never written here: the reader must keep
                         // draining output even while the child isn't reading
-                        let _ = replies.send(bytes);
+                        let _ = replies.send(Input::Bytes(bytes));
                     }
                     on_output();
                 }

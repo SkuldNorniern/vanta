@@ -134,7 +134,17 @@ impl Vt {
             self.screen.remove(self.scroll_bottom);
             self.screen.insert(self.cy, Row::blank(self.cols));
         }
+        self.unwrap_row(self.cy.checked_sub(1));
+        self.unwrap_row(Some(self.scroll_bottom));
         self.cx = 0;
+    }
+
+    /// Row `row` no longer runs on into the one below: what was below it
+    /// moved away.
+    fn unwrap_row(&mut self, row: Option<usize>) {
+        if let Some(row) = row.and_then(|r| self.screen.get_mut(r)) {
+            row.wrapped = false;
+        }
     }
 
     /// Delete `n` lines at the cursor row (within the scroll region).
@@ -149,14 +159,19 @@ impl Vt {
             self.screen
                 .insert(self.scroll_bottom, Row::blank(self.cols));
         }
+        self.unwrap_row(self.cy.checked_sub(1));
+        self.unwrap_row((self.scroll_bottom + 1).checked_sub(n + 1));
         self.cx = 0;
     }
 
     /// Insert `n` blank characters at the cursor column (shift right, drop overflow).
     pub(super) fn insert_chars(&mut self, n: usize) {
         self.edit_col();
-        let row = &mut self.screen[self.cy];
         let n = n.min(self.cols - self.cx);
+        // no wide glyph split at the cursor or where the edge cuts the line
+        self.break_wide_at(self.cy, self.cx);
+        self.break_wide_at(self.cy, self.cols - n);
+        let row = &mut self.screen[self.cy];
         row[self.cx..].rotate_right(n);
         let blank = Cell::blank();
         for cell in &mut row[self.cx..self.cx + n] {
@@ -167,8 +182,10 @@ impl Vt {
     /// Delete `n` characters at the cursor column (shift left, fill right with blank).
     pub(super) fn delete_chars(&mut self, n: usize) {
         self.edit_col();
-        let row = &mut self.screen[self.cy];
         let n = n.min(self.cols - self.cx);
+        self.break_wide_at(self.cy, self.cx);
+        self.break_wide_at(self.cy, self.cx + n);
+        let row = &mut self.screen[self.cy];
         row[self.cx..].rotate_left(n);
         let blank = Cell::blank();
         for cell in &mut row[self.cols - n..] {
@@ -403,12 +420,15 @@ impl Vt {
         }
         self.screen
             .insert(self.scroll_bottom, Row::blank(self.cols));
+        self.unwrap_row(self.scroll_top.checked_sub(1));
     }
 
     /// Scroll the scroll region down by one line (used by reverse-index / CSI T).
     pub(super) fn scroll_down(&mut self) {
         self.screen.remove(self.scroll_bottom);
         self.screen.insert(self.scroll_top, Row::blank(self.cols));
+        self.unwrap_row(self.scroll_top.checked_sub(1));
+        self.unwrap_row(Some(self.scroll_bottom));
     }
 
     /// Resize the grid, preserving overlapping content; clamps the cursor and
